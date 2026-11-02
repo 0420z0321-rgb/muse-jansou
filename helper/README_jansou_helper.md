@@ -18,7 +18,11 @@ python3 jansou_helper.py status --json
 python3 jansou_helper.py act 2
 python3 jansou_helper.py events
 python3 jansou_helper.py events --all-pages
+python3 jansou_helper.py paipu
+python3 jansou_helper.py paipu --match g0:initial --out paipu.ndjson
 ```
+
+`paipu` は終了した半荘の牌譜（NDJSON、全イベント列＋最終結果）をダウンロードしてファイルに保存します。対局中の半荘は書き出せません。形式の仕様は `server/PAIPU.md` を参照してください。
 
 `status` は自席の手牌・点数・河・ドラ・判断待ち・番号付き合法手を表示します。Muse自身が1手を選び、`act 2` のようにその番号を指定してください。番号指定は直近の `status` を必要とします。明示指定もできます。
 

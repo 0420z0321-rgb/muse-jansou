@@ -40,6 +40,8 @@ DEFAULT_BASE = "https://muse-jansou.muse-jansou.workers.dev"
 DEFAULT_ROOM = "a508cc53-02f5-45a2-948e-c6dc56253fb9"
 HTTP_TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# 牌譜（paipu）は半荘分のスナップショット列なので、通常応答より大きい上限を使う。
+PAIPU_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 SUIT_NUMBERS = "一二三四五六七八九"
 HONORS = ("東", "南", "西", "北", "白", "發", "中")
 SEATS = ("東", "南", "西", "北")
@@ -280,6 +282,45 @@ class API:
         if data.get("error") is not None:
             raise APIError(status, str(data["error"]), data)
         return data
+
+    def call_raw(self, method: str, suffix: str,
+                 query: Optional[dict] = None) -> bytes:
+        """JSON化しない応答（牌譜NDJSONのダウンロード用）。GETは冪等なので
+        転送層の失敗に限り再試行する。通常応答とは別の大きい上限を使う。"""
+        attempts = 3 if method == "GET" else 1
+        last_error: Optional[APIError] = None
+        for _ in range(attempts):
+            try:
+                return self._call_raw_once(method, suffix, query)
+            except APIError as error:
+                last_error = error
+                if error.status is not None:
+                    raise
+        assert last_error is not None
+        raise last_error
+
+    def _call_raw_once(self, method: str, suffix: str,
+                       query: Optional[dict] = None) -> bytes:
+        url = self.base + "/rooms/" + urllib.parse.quote(self.room_id, safe="") + "/" + suffix
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        headers = {"Accept": "application/x-ndjson", "User-Agent": "MuseJansouHelper/%s" % VERSION}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = urllib.request.Request(url, headers=headers, method=method)
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                raw = response.read(PAIPU_MAX_RESPONSE_BYTES + 1)
+                if len(raw) > PAIPU_MAX_RESPONSE_BYTES:
+                    raise APIError(response.status, "response too large")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read(MAX_RESPONSE_BYTES)
+            data = self._decode(raw, allow_error=True)
+            error = data.get("error", "non-JSON response")
+            raise APIError(exc.code, str(error), data)
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as exc:
+            raise APIError(None, "network/timeout (%s)" % type(exc).__name__)
+        return raw
 
     @staticmethod
     def _decode(raw: bytes, allow_error: bool = False) -> dict:
@@ -1120,6 +1161,53 @@ def cmd_events(args: argparse.Namespace, files: SecureFiles) -> int:
         return 0
 
 
+def cmd_paipu(args: argparse.Namespace, files: SecureFiles) -> int:
+    with files.lock():
+        config, api = load_context(files, args.timeout)
+        query = {}
+        if args.match:
+            query["match"] = args.match
+        raw = api.call_raw("GET", "paipu", query=query or None)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HelperError("牌譜の応答がUTF-8ではありません。")
+        lines = [line for line in text.splitlines() if line.strip()]
+        if len(lines) < 2:
+            raise HelperError("牌譜の応答が不足しています。")
+        try:
+            header = json.loads(lines[0])
+            footer = json.loads(lines[-1])
+        except ValueError:
+            raise HelperError("牌譜のヘッダー/フッターがJSONではありません。")
+        if not is_obj(header) or header.get("type") != "paipu_header" or header.get("schema_version") != 1:
+            raise HelperError("牌譜ヘッダーの形式が不正です。")
+        if not is_obj(footer) or footer.get("type") != "paipu_footer":
+            raise HelperError("牌譜フッターの形式が不正です。")
+        event_lines = lines[1:-1]
+        if header.get("event_count") != len(event_lines):
+            raise HelperError("牌譜のイベント件数がヘッダーと一致しません。")
+        match_key = str(header.get("match_key", "match"))
+        out = args.out
+        if not out:
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in match_key)
+            out = "paipu-%s.ndjson" % safe
+        with open(out, "wb") as fh:
+            fh.write(raw if raw.endswith(b"\n") else raw + b"\n")
+        print("牌譜を保存しました: %s" % out)
+        print("match_key=%s イベント=%d件 完全=%s" % (
+            match_key, len(event_lines),
+            "はい" if header.get("complete") else "いいえ（開始イベント欠落）"))
+        results = footer.get("results", [])
+        if isinstance(results, list):
+            for r in results:
+                if is_obj(r) and is_int(r.get("seat")) and 0 <= r["seat"] <= 3:
+                    print("%s位 %s（%s席）%s点" % (
+                        r.get("rank", "?"), r.get("display_name", "?"),
+                        SEATS[r["seat"]], r.get("score", "?")))
+        return 0
+
+
 def cmd_support(args: argparse.Namespace, files: SecureFiles) -> int:
     """Spectatorの応援先変更。試合中の可否はサーバーが決定する。"""
     with files.lock():
@@ -1507,6 +1595,9 @@ def parser() -> argparse.ArgumentParser:
     e.add_argument("--all-pages", action="store_true", help="続きがあれば複数ページ取得")
     e.add_argument("--max-pages", type=int, default=20, help="複数ページの最大回数")
     e.add_argument("--json", action="store_true", help="機械可読JSONを出力")
+    p = subs.add_parser("paipu", help="終了した半荘の牌譜（NDJSON）をダウンロード")
+    p.add_argument("--match", help="match_key（省略時は最新の終了済み半荘）")
+    p.add_argument("--out", help="保存先ファイル（省略時は paipu-<match_key>.ndjson）")
     support = subs.add_parser("support", help="Spectatorの応援席を変更（半荘終了後のみ）")
     support.add_argument("seat", type=int, choices=range(4), help="応援する席0～3")
 
@@ -1552,6 +1643,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "clear-pending": cmd_clear_pending,
             "clear-pending-cheer": cmd_clear_pending_cheer,
             "events": cmd_events,
+            "paipu": cmd_paipu,
             "support": cmd_support,
             "cheer": cmd_cheer,
             "cheers": cmd_cheers,

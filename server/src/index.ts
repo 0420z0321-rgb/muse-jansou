@@ -78,6 +78,7 @@ function validCreate(body: JsonObject, dev: boolean): string | null {
 const METHODS: Record<string, "GET" | "POST" | "BOTH"> = {
   state: "GET",
   events: "GET",
+  paipu: "GET",
   actions: "POST",
   claim: "POST",
   invites: "POST",
@@ -178,7 +179,7 @@ export default {
         }, 201);
       }
 
-      const m = path.match(/^\/rooms\/([^/]+)\/(state|leave|vacate|queue\/leave|queue-status|queue|events|actions|claim|invites|join|spectators\/support|spectators|cheers\/flag|cheer-settings|cheers|seat-tokens|watch-password|watch-open|watch|debug|dev\/advance-time)$/);
+      const m = path.match(/^\/rooms\/([^/]+)\/(state|leave|vacate|queue\/leave|queue-status|queue|events|paipu|actions|claim|invites|join|spectators\/support|spectators|cheers\/flag|cheer-settings|cheers|seat-tokens|watch-password|watch-open|watch|debug|dev\/advance-time)$/);
       if (!m) return json({ error: "not found" }, 404);
       const roomId = m[1];
       const suffix = m[2];

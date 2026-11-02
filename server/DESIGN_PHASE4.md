@@ -68,6 +68,7 @@
 | POST | `/rooms` | 全体Master | 卓作成・Master/4席トークン発行 |
 | GET | `/state` | Master/Player/Spectator | 閲覧者別allowlist局面。`viewer.role`,`viewer.seat`を付与 |
 | GET | `/events?after=N` | Master/Player/Spectator | 差分イベント（同一allowlistでフィルタ） |
+| GET | `/paipu?match=K` | Master/Player/Spectator | 終了した半荘の牌譜（NDJSON、全イベント列＋結果。仕様は `PAIPU.md`） |
 | POST | `/claim` | Player | `{seat,decision_id}`；席・所有者チェック |
 | POST | `/actions` | Player | 既存action本文。認証済み所属席のactionのみ |
 | POST | `/invites` | Room Master | 招待発行 |

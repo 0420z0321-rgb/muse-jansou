@@ -230,6 +230,9 @@ type Invite = {
 type Viewer = Pick<Principal, "role" | "seat"> & { participant_id?: string };
 const MAX_EVENTS_PAGE = 50;
 const RETAIN_EVENTS = 500;
+// Paipu archives survive the events trim; only the newest few finished
+// matches are kept per room (same horizon as recentMatchResults).
+const PAIPU_RETAINED_MATCHES = 5;
 const MAX_NAME_LENGTH = 80;
 const MAX_CHEER_LENGTH = 500;
 const CHEER_INTERVAL_MS = 30_000;
@@ -497,6 +500,12 @@ export class RoomDO extends DurableObject {
         }
         sql.exec(
           "CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL, kind TEXT NOT NULL, snapshot TEXT NOT NULL, created_at INTEGER NOT NULL)",
+        );
+        // Paipu archive: the same archival snapshots as events, keyed by
+        // match and exempt from the RETAIN_EVENTS trim so a finished match
+        // can be exported whole (see PAIPU.md). Pruned per finished match.
+        sql.exec(
+          "CREATE TABLE IF NOT EXISTS paipu_events (match_key TEXT NOT NULL, seq INTEGER NOT NULL, revision INTEGER NOT NULL, kind TEXT NOT NULL, snapshot TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (match_key, seq))",
         );
 
         // Phase R2: independent ownership from Phase-4 credential membership.
@@ -787,6 +796,18 @@ export class RoomDO extends DurableObject {
     }
     this.metaSet("ranking_recorded_match_key", matchKey);
     this.opsLog("match_ranking_recorded", { match_key: matchKey, finished_at: finishedAt });
+    // Paipu retention: keep archives for the newest finished matches only.
+    // Ranking rows are the durable record and stay; only the bulky event
+    // snapshots are pruned. The just-finished match is always kept.
+    const keepKeys = this.ctx.storage.sql.exec(
+      "SELECT match_key FROM ranking_matches ORDER BY finished_at DESC LIMIT ?",
+      PAIPU_RETAINED_MATCHES,
+    ).toArray().map(row => String(row.match_key));
+    if (!keepKeys.includes(matchKey)) keepKeys.push(matchKey);
+    const placeholders = keepKeys.map(() => "?").join(", ");
+    this.ctx.storage.sql.exec(
+      `DELETE FROM paipu_events WHERE match_key NOT IN (${placeholders})`, ...keepKeys,
+    );
   }
 
   /** Public leaderboard; bootstrap rows remain in the ledger but not in totals. */
@@ -1034,11 +1055,22 @@ export class RoomDO extends DurableObject {
     this.injectTime(timeOffsetMs);
     const raw: unknown = publicState(next);
     const archival = viewState(raw, { role: "master", seat: null }, policy);
+    const snapshotJson = JSON.stringify(archival);
+    const createdAt = Date.now();
     this.ctx.storage.sql.exec(
       "INSERT INTO events (revision, kind, snapshot, created_at) VALUES (?, ?, ?, ?)",
-      next.revision, kind, JSON.stringify(archival), Date.now(),
+      next.revision, kind, snapshotJson, createdAt,
     );
     const last = this.ctx.storage.sql.exec("SELECT MAX(seq) AS n FROM events").toArray()[0];
+    if (last) {
+      // Mirror into the paipu archive under the current match key. The
+      // archive is not trimmed with events; it is pruned per finished
+      // match in recordFinishedMatchTx.
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO paipu_events (match_key, seq, revision, kind, snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        this.rankingMatchKey(next), Number(last.n), next.revision, kind, snapshotJson, createdAt,
+      );
+    }
     if (last && Number(last.n) % 50 === 0) {
       this.ctx.storage.sql.exec("DELETE FROM events WHERE seq <= ?", Number(last.n) - RETAIN_EVENTS);
     }
@@ -1532,6 +1564,97 @@ export class RoomDO extends DurableObject {
     return json({ events, latest_seq: cursor, server_latest_seq: serverLatest, has_more: cursor < serverLatest });
   }
 
+  /**
+   * Public endpoint: GET /rooms/{roomId}/paipu[?match=<match_key>].
+   * Exports one finished match as an NDJSON paipu file (see PAIPU.md):
+   * a header line, one line per archived event (master-view snapshots,
+   * untrimmed), and a footer line with the recorded results.
+   *
+   * The stored snapshots are full-information, so export is limited to
+   * matches already recorded as finished in ranking_matches; a match in
+   * progress is never exportable. Any enabled credential may download.
+   */
+  private async handlePaipu(request: Request, who: Principal): Promise<Response> {
+    const requested = new URL(request.url).searchParams.get("match");
+    let matchKey: string | null = null;
+    if (requested !== null && requested.length > 0) {
+      if (requested.length > 200) return json({ error: "invalid match key" }, 400);
+      matchKey = requested;
+    } else {
+      const latest = this.ctx.storage.sql.exec(
+        "SELECT match_key FROM ranking_matches ORDER BY finished_at DESC LIMIT 1",
+      ).toArray()[0];
+      if (latest === undefined) return json({ error: "no_finished_match" }, 404);
+      matchKey = String(latest.match_key);
+    }
+    const matchRow = this.ctx.storage.sql.exec(
+      "SELECT finished_at FROM ranking_matches WHERE match_key = ?", matchKey,
+    ).toArray()[0];
+    if (matchRow === undefined) {
+      if (this.game !== null && this.rankingMatchKey(this.game) === matchKey) {
+        return json({ error: "match_not_finished" }, 409);
+      }
+      return json({ error: "match_not_found" }, 404);
+    }
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT seq, revision, kind, snapshot FROM paipu_events WHERE match_key = ? ORDER BY seq",
+      matchKey,
+    ).toArray();
+    if (rows.length === 0) return json({ error: "paipu_expired" }, 410);
+    const results = this.ctx.storage.sql.exec(
+      "SELECT seat, participant_id, display_name, icon, score, rank FROM ranking_results WHERE match_key = ? ORDER BY seat",
+      matchKey,
+    ).toArray().map(row => ({
+      seat: Number(row.seat),
+      participant_id: String(row.participant_id),
+      display_name: String(row.display_name),
+      icon: row.icon === null || row.icon === undefined ? null : String(row.icon),
+      score: Number(row.score),
+      rank: Number(row.rank),
+    }));
+    const first = rows[0];
+    const lastRow = rows[rows.length - 1];
+    const header = {
+      type: "paipu_header",
+      schema_version: 1,
+      room_id: this.roomId,
+      match_key: matchKey,
+      exported_at: Date.now(),
+      event_count: rows.length,
+      first_seq: Number(first.seq),
+      last_seq: Number(lastRow.seq),
+      // The stream is complete when it starts with the match's init event.
+      complete: String(first.kind) === "init",
+      requested_by: who.role,
+    };
+    const footer = {
+      type: "paipu_footer",
+      match_key: matchKey,
+      finished_at: Number(matchRow.finished_at),
+      results,
+    };
+    const lines = [JSON.stringify(header)];
+    for (const row of rows) {
+      lines.push(JSON.stringify({
+        type: "event",
+        seq: Number(row.seq),
+        revision: Number(row.revision),
+        kind: String(row.kind),
+        state: JSON.parse(String(row.snapshot)) as unknown,
+      }));
+    }
+    lines.push(JSON.stringify(footer));
+    const safeKey = matchKey.replace(/[^a-zA-Z0-9_-]+/g, "_");
+    return new Response(lines.join("\n") + "\n", {
+      status: 200,
+      headers: {
+        "content-type": "application/x-ndjson; charset=utf-8",
+        "content-disposition": `attachment; filename="paipu-${this.roomId ?? "room"}-${safeKey}.ndjson"`,
+        "cache-control": "no-store",
+      },
+    });
+  }
+
   /** Invite grant policy is centralized for future delegated inviter roles. */
   private canIssueInvites(who: Principal): boolean {
     return who.role === "master";
@@ -1945,6 +2068,7 @@ export class RoomDO extends DurableObject {
       if (path === "/vacate" && request.method === "POST") return await this.handleVacate(request, principal);
       if (path === "/state" && request.method === "GET") return await this.handleState(principal);
       if (path === "/events" && request.method === "GET") return await this.handleEvents(request, principal);
+      if (path === "/paipu" && request.method === "GET") return await this.handlePaipu(request, principal);
       if (path === "/actions" && request.method === "POST") return await this.handleActions(request, principal);
       if (path === "/claim" && request.method === "POST") return await this.handleClaim(request, principal);
       if (path === "/invites" && request.method === "POST") return await this.handleInvites(request, principal);

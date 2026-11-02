@@ -239,6 +239,8 @@ const PROXY_MAX_PLAYS = 5;
 // Paipu archives survive the events trim; only the newest few finished
 // matches are kept per room (same horizon as recentMatchResults).
 const PAIPU_RETAINED_MATCHES = 5;
+/** Small, completed-only hand snapshots; never an active Game snapshot. */
+const FINISHED_HAND_RETAINED = 128;
 const MAX_NAME_LENGTH = 80;
 const MAX_CHEER_LENGTH = 500;
 const CHEER_INTERVAL_MS = 30_000;
@@ -438,10 +440,409 @@ function validateAvatarUrl(v: unknown): boolean {
   } catch { return false; }
 }
 function parseCursor(url: URL): number | null {
-  const param = url.searchParams.get("after") ?? "0";
+  return parseCursorParam(url, "after");
+}
+function parseCursorParam(url: URL, name: string): number | null {
+  const param = url.searchParams.get(name) ?? "0";
   if (!/^(0|[1-9]\d{0,14})$/.test(param)) return null;
   const after = Number(param);
   return Number.isSafeInteger(after) ? after : null;
+}
+
+/** Terminal state is explicit. A hand change or score change alone is NOT proof
+ *  that the last hand's final tiles exist in the new engine snapshot. */
+function terminalHandSnapshot(snapshot: unknown): JsonObject | null {
+  if (!isObject(snapshot)) return null;
+  if (isObject(snapshot.hand) && snapshot.hand.phase === "finished" &&
+      Array.isArray(snapshot.hand.hands) && snapshot.hand.hands.length === 4) return snapshot.hand;
+  if (snapshot.phase === "finished") return snapshot;
+  return null;
+}
+function fourScores(value: unknown): number[] | null {
+  return Array.isArray(value) && value.length === 4 && value.every(isInt)
+    ? value as number[] : null;
+}
+/** Stable identity is optional; do not infer it from a moving score or turn. */
+function handIdentifier(snapshot: JsonObject): string | null {
+  const hand = isObject(snapshot.hand) ? snapshot.hand : null;
+  const handId = snapshot.hand_id ?? hand?.hand_id;
+  if ((typeof handId === "string" && handId.length > 0 && handId.length <= 128) ||
+      (isInt(handId) && handId >= 0)) return `id:${String(handId)}`;
+  const index = snapshot.hand_index ?? hand?.hand_index;
+  if (isInt(index) && index >= 0) return `index:${index}`;
+  // Do not assume a changing round label, kyotaku or honba is a hand identity.
+  return null;
+}
+
+// ---- Watch event stream v2: public facts ONLY, no private draw tile. ----
+// The old `draw` signal is *hand draw/ryuukyoku*. A player's tile draw is
+// `tile_draw` to keep pre-existing watch-SE event names compatible.
+type WatchCallType = "chi" | "pon" | "kan";
+type WatchWinType = "tsumo" | "ron";
+type WatchTile = string | number | { suit: "m" | "p" | "s" | "z"; rank: number; red?: boolean };
+type WatchSignal =
+  | { type: "tile_draw"; seat: number }
+  | { type: "discard"; seat: number; tile: WatchTile | null }
+  | { type: "call"; seat: number; call_type: WatchCallType | null }
+  | { type: "riichi"; seat: number }
+  | { type: "win"; seat: number; win_type: WatchWinType | null; from_seat?: number }
+  | { type: "draw" }
+  | { type: "hand_start" }
+  | { type: "hand_end" }
+  | { type: "score_change"; seat: number };
+const MAX_WATCH_SIGNALS = 32;
+
+/** The old event archive uses a master-view snapshot. NEVER ship it to guests.
+ * Project to a spectator that does NOT get open-hands access, even when the
+ * host has enabled watch_open_hands on the main watch page. */
+function soundView(snapshot: unknown, policy: RoomPolicy): JsonObject {
+  return viewState(snapshot,
+    { role: "spectator", seat: null, participant_id: "watch-event-only" },
+    { ...policy, player_visibility: "seat_only", watch_open_hands: false });
+}
+
+function soundHand(state: JsonObject): JsonObject {
+  const hand = state.hand;
+  return isObject(hand) && (Array.isArray(hand.discards) ||
+    Array.isArray(hand.melds) || typeof hand.phase === "string") ? hand : state;
+}
+
+function soundHandKey(state: JsonObject): string | null {
+  const hand = soundHand(state);
+  const id = hand.hand_id ?? state.hand_id;
+  const matchId = state.match_id;
+  const prefix = (typeof matchId === "string" && matchId.length <= 128) ? matchId + "/" : "";
+  if ((typeof id === "string" && id.length > 0 && id.length <= 128) ||
+      (isInt(id) && id >= 0)) return prefix + "id:" + String(id);
+  const index = hand.hand_index ?? state.hand_index;
+  if (isInt(index) && index >= 0) return prefix + "index:" + index;
+  const round = isObject(state.round) ? state.round : null;
+  const wind = hand.round_wind ?? state.round_wind ?? round?.wind;
+  const number = hand.round_number ?? state.round_number ?? round?.number;
+  const honba = hand.honba ?? state.honba;
+  const dealer = hand.dealer ?? state.dealer;
+  if ((typeof wind === "string" || isInt(wind)) && isInt(number) &&
+      isInt(honba) && isSeat(dealer)) {
+    return prefix + "round:" + String(wind) + ":" + number + ":" + honba + ":" + dealer;
+  }
+  return null;
+}
+
+function soundRows(state: JsonObject, key: "discards" | "melds"): unknown[][] | null {
+  const nested = soundHand(state)[key];
+  const source = Array.isArray(nested) ? nested : state[key];
+  return Array.isArray(source) && source.length === 4 &&
+    source.every(Array.isArray) ? source as unknown[][] : null;
+}
+
+function soundRiichi(state: JsonObject, seat: number): boolean {
+  const hand = soundHand(state);
+  for (const value of [hand.riichi_flags, hand.riichi, state.riichi_flags, state.riichi]) {
+    if (!Array.isArray(value)) continue;
+    const marker: unknown = value[seat];
+    if (marker === true || (typeof marker === "number" && marker > 0)) return true;
+    if (isObject(marker) && marker.declared === true) return true;
+  }
+  return false;
+}
+
+function soundScores(state: JsonObject): number[] | null {
+  const root = fourScores(state.scores);
+  if (root !== null) return root;
+  if (isObject(state.match)) return fourScores(state.match.scores);
+  return null;
+}
+
+function soundResult(state: JsonObject): JsonObject | null {
+  const hand = soundHand(state);
+  return isObject(hand.result) ? hand.result :
+    isObject(state.result) ? state.result : null;
+}
+
+function soundFinished(state: JsonObject): boolean {
+  return state.phase === "finished" || soundHand(state).phase === "finished";
+}
+
+/** Public discard tile only. Object values are rebuilt field by field; NO
+ * nested engine object or private red/hand metadata is copied. */
+function soundTile(value: unknown): WatchTile | null {
+  if (isInt(value) && value >= 0 && value <= 135) return value;
+  if (typeof value === "string") {
+    // Supported compact notations, Unicode tile glyphs and Japanese honors.
+    // Never forward arbitrary string data from a future engine shape.
+    if (/^(?:[0-9]{1,2}[mpsz]|[mpsz][0-9]{1,2}|[1-9](?:man|pin|sou)|[一二三四五六七八九][萬万筒索]|[1-9][萬万筒索]|[東南西北白發発中]|[ESWNPCF]|[🀀-🀫]|(?:aka|red)[0-9][mps])$/iu.test(value)) return value;
+    return null;
+  }
+  if (isObject(value) &&
+      (value.suit === "m" || value.suit === "p" || value.suit === "s" || value.suit === "z") &&
+      isInt(value.rank) && value.rank >= 0 && value.rank <= (value.suit === "z" ? 7 : 9)) {
+    const tile: WatchTile = { suit: value.suit, rank: value.rank };
+    if (value.red === true || value.is_red === true) tile.red = true;
+    return tile;
+  }
+  return null;
+}
+
+function soundDiscardTile(record: unknown): WatchTile | null {
+  if (isObject(record)) return soundTile(record.tile) ?? soundTile(record.name);
+  return soundTile(record);
+}
+
+function soundCallType(value: unknown): WatchCallType | null {
+  if (typeof value !== "string") return null;
+  const type = value.toLowerCase();
+  if (["chi", "chii", "chow"].includes(type)) return "chi";
+  if (["pon", "pung"].includes(type)) return "pon";
+  if (["kan", "ankan", "kakan", "daiminkan", "minkan", "shouminkan", "kong"].includes(type)) return "kan";
+  return null;
+}
+
+function soundWinType(value: unknown): WatchWinType | null {
+  if (typeof value !== "string") return null;
+  const type = value.toLowerCase();
+  if (["tsumo", "tsumo_agari", "zimo", "自摸", "ツモ"].includes(type)) return "tsumo";
+  if (["ron", "ron_agari", "栄和", "ロン"].includes(type)) return "ron";
+  return null;
+}
+
+function soundWinnerSeats(result: JsonObject, state: JsonObject): number[] {
+  const winners: number[] = [];
+  if (Array.isArray(result.winners)) {
+    for (const seat of result.winners) if (isSeat(seat) && !winners.includes(seat)) winners.push(seat);
+  }
+  if (winners.length === 0) {
+    const seat = isSeat(result.winner) ? result.winner : state.winner;
+    if (isSeat(seat)) winners.push(seat);
+  }
+  return winners;
+}
+
+function soundIsDraw(result: JsonObject, state: JsonObject): boolean {
+  if (Array.isArray(result.tenpai)) return true;
+  const reason = result.reason ?? result.type ?? state.end_reason;
+  if (typeof reason !== "string") return false;
+  return ["draw", "ryuukyoku", "ryukyoku", "exhaustive", "abortive", "流局"].some(
+    marker => reason.toLowerCase().includes(marker));
+}
+
+function soundWallCount(state: JsonObject): number | null {
+  const value = soundHand(state).wall_count ?? state.wall_count;
+  return isInt(value) && value >= 0 ? value : null;
+}
+
+function soundRinshanUsed(state: JsonObject): number | null {
+  const value = soundHand(state).rinshan_used ?? state.rinshan_used;
+  return isInt(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Classify two *public spectator projections* at the successful commit.
+ * Does not peek at drawn_tile/drawn_tiles/hand contents. `tile_draw` uses
+ * public wall_count/rinshan_used movement and public turn only; bundled
+ * automatic game transitions with no such public witness cannot be invented.
+ * A scalar tile on `discard` comes ONLY from a published discard record.
+ */
+function makeWatchSignals(previous: JsonObject | null, current: JsonObject,
+                          cause: string, actionHint?: unknown): WatchSignal[] {
+  const output: WatchSignal[] = [];
+  const seen = new Set<string>();
+  const push = (signal: WatchSignal, key?: string): void => {
+    if (output.length >= MAX_WATCH_SIGNALS) return;
+    if (key !== undefined) {
+      if (seen.has(key)) return;
+      seen.add(key);
+    }
+    output.push(signal);
+  };
+  const unique = (signal: WatchSignal): void =>
+    push(signal, signal.type + ":" + ("seat" in signal ? signal.seat : ""));
+
+  if (previous === null) {
+    if (cause === "init") unique({ type: "hand_start" });
+    return output;
+  }
+
+  const prevKey = soundHandKey(previous);
+  const nextKey = soundHandKey(current);
+  const oldDiscards = soundRows(previous, "discards");
+  const newDiscards = soundRows(current, "discards");
+  const oldTotal = oldDiscards?.reduce((n, list) => n + list.length, 0) ?? null;
+  const newTotal = newDiscards?.reduce((n, list) => n + list.length, 0) ?? null;
+  const handChanged = (prevKey !== null && nextKey !== null && prevKey !== nextKey) ||
+    (prevKey === null && nextKey === null && oldTotal !== null && newTotal === 0 && oldTotal > 0);
+
+  if (!handChanged) {
+    // A legitimate discard is visible in the public river. Retain its exact
+    // order and tile; if the tile is an unknown format, use explicit null.
+    if (oldDiscards && newDiscards) {
+      for (let seat = 0; seat < 4; seat++) {
+        const before = oldDiscards[seat], after = newDiscards[seat];
+        if (after.length > before.length) {
+          for (let index = before.length; index < after.length; index++) {
+            const record = after[index];
+            push({ type: "discard", seat, tile: soundDiscardTile(record) });
+            if (isObject(record) && (record.riichi === true || record.riichi_discard === true)) {
+              unique({ type: "riichi", seat });
+            }
+          }
+        }
+      }
+    }
+
+    const oldMelds = soundRows(previous, "melds");
+    const newMelds = soundRows(current, "melds");
+    if (oldMelds && newMelds) {
+      for (let seat = 0; seat < 4; seat++) {
+        const oldList = oldMelds[seat], newList = newMelds[seat];
+        for (let j = 0; j < newList.length; j++) {
+          if (j < oldList.length && JSON.stringify(oldList[j]) === JSON.stringify(newList[j])) continue;
+          const meld = newList[j];
+          const callType = isObject(meld) ? soundCallType(meld.type) : null;
+          // A changed existing pon -> added kan is a public kan as well.
+          push({ type: "call", seat, call_type: callType });
+        }
+      }
+    }
+    for (let seat = 0; seat < 4; seat++) {
+      if (!soundRiichi(previous, seat) && soundRiichi(current, seat)) unique({ type: "riichi", seat });
+    }
+
+    // Drawing a tile is public; its ID and value are NOT. A decrease in the
+    // public wall count is evidence of one draw by the current turn seat.
+    // Kan replacement draws can use rinshan_used even if wall_count is static.
+    const oldWall = soundWallCount(previous);
+    const newWall = soundWallCount(current);
+    const oldRinshan = soundRinshanUsed(previous);
+    const newRinshan = soundRinshanUsed(current);
+    const wallDraw = oldWall !== null && newWall !== null && oldWall > newWall;
+    const rinshanDraw = oldRinshan !== null && newRinshan !== null && newRinshan > oldRinshan;
+    const drawingSeat = soundHand(current).turn ?? current.turn;
+    // Some engines expose hand sizes but not a wall count at every decision.
+    // A visible one-tile increase in the current seat is also proof of a draw;
+    // a mere turn change is NOT proof and must not trigger an event.
+    const oldCounts = soundHand(previous).hand_counts ?? previous.hand_counts;
+    const newCounts = soundHand(current).hand_counts ?? current.hand_counts;
+    const countDraw = isSeat(drawingSeat) && Array.isArray(oldCounts) &&
+      Array.isArray(newCounts) && oldCounts.length === 4 && newCounts.length === 4 &&
+      isInt(oldCounts[drawingSeat]) && isInt(newCounts[drawingSeat]) &&
+      newCounts[drawingSeat] === oldCounts[drawingSeat] + 1;
+    if ((wallDraw || rinshanDraw || countDraw) && isSeat(drawingSeat) && !soundFinished(current)) {
+      unique({ type: "tile_draw", seat: drawingSeat });
+    }
+  }
+
+  // Only a completed result already present in the spectator projection is
+  // enough to announce a win. An accepted ron action alone is not proof (and
+  // could otherwise reveal an unresolved reaction decision).
+  const oldResult = soundResult(previous);
+  const result = soundResult(current);
+  const resultAppeared = result !== null && (oldResult === null ||
+    JSON.stringify(oldResult) !== JSON.stringify(result));
+  const newlyFinished = !soundFinished(previous) && soundFinished(current);
+  if (!handChanged && soundFinished(current) && (resultAppeared || newlyFinished)) {
+    // Older engines can publish terminal winner/win_type directly on the
+    // public state, without an explicit `result` object.
+    const finalInfo: JsonObject = result ?? {};
+    const winners = soundWinnerSeats(finalInfo, current);
+    const hint = cause === "action" && isObject(actionHint) ? actionHint.action : null;
+    const winType = soundWinType(finalInfo.win_type ?? finalInfo.type ?? current.win_type) ?? soundWinType(hint);
+    if (winners.length && (result !== null || winType !== null)) {
+      const from = isSeat(finalInfo.from_seat) ? finalInfo.from_seat :
+        (isSeat(current.from_seat) ? current.from_seat : null);
+      for (const seat of winners) {
+        if (winType === "ron" && from !== null && from !== seat) {
+          unique({ type: "win", seat, win_type: winType, from_seat: from });
+        } else {
+          unique({ type: "win", seat, win_type: winType });
+        }
+      }
+    } else if (soundIsDraw(finalInfo, current)) {
+      unique({ type: "draw" }); // Ryuukyoku, not drawing one tile.
+    }
+  }
+
+  if (newlyFinished || handChanged) unique({ type: "hand_end" });
+  if (handChanged) unique({ type: "hand_start" });
+
+  // Action hint fallback (whitelisted only) when a public layout lacks a
+  // normal meld/discard record. Only accepted, committed actions reach here.
+  // Never copy request.tile: it may be a private hand selection rather than a
+  // published river tile. A fallback discard can explicitly carry tile:null.
+  if (!handChanged && cause === "action" && isObject(actionHint) && isSeat(actionHint.seat) &&
+      typeof actionHint.action === "string") {
+    const seat = actionHint.seat;
+    const action = actionHint.action.toLowerCase();
+    if (["discard", "dahai"].includes(action) && !output.some(s => s.type === "discard" && s.seat === seat)) {
+      const oldLast = soundHand(previous).last_discard ?? previous.last_discard;
+      const newLast = soundHand(current).last_discard ?? current.last_discard;
+      const tile = JSON.stringify(oldLast) === JSON.stringify(newLast)
+        ? null : soundDiscardTile(newLast);
+      unique({ type: "discard", seat, tile });
+    } else if (soundCallType(action) !== null && !output.some(s => s.type === "call" && s.seat === seat)) {
+      unique({ type: "call", seat, call_type: soundCallType(action) });
+    } else if (["riichi", "reach"].includes(action)) {
+      unique({ type: "riichi", seat });
+    } else if (["draw_tile", "tsumo_draw"].includes(action)) {
+      // A draw action is safe to report only as a seat, never a drawn tile.
+      unique({ type: "tile_draw", seat });
+    }
+  }
+
+  const oldScores = soundScores(previous);
+  const newScores = soundScores(current);
+  if (oldScores && newScores) {
+    for (let seat = 0; seat < 4; seat++) {
+      if (oldScores[seat] !== newScores[seat]) unique({ type: "score_change", seat });
+    }
+  }
+  return output;
+}
+
+/** All public HTTP payloads are rebuilt from a strict output allowlist,
+ * even for pre-upgrade rows or a malformed persisted JSON blob. */
+function readWatchSignals(value: unknown): WatchSignal[] {
+  if (typeof value !== "string") return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return []; }
+  if (!Array.isArray(parsed)) return [];
+  const result: WatchSignal[] = [];
+  for (const entry of parsed.slice(0, MAX_WATCH_SIGNALS)) {
+    if (!isObject(entry) || typeof entry.type !== "string") continue;
+    const seat = entry.seat;
+    switch (entry.type) {
+      case "tile_draw":
+        if (isSeat(seat)) result.push({ type: "tile_draw", seat });
+        break;
+      case "discard":
+        if (isSeat(seat)) result.push({ type: "discard", seat,
+          tile: soundTile(entry.tile) });
+        break;
+      case "call":
+        if (isSeat(seat)) result.push({ type: "call", seat,
+          call_type: soundCallType(entry.call_type) });
+        break;
+      case "riichi":
+        if (isSeat(seat)) result.push({ type: "riichi", seat });
+        break;
+      case "win":
+        if (isSeat(seat)) {
+          const winType = soundWinType(entry.win_type);
+          const from = entry.from_seat;
+          result.push(winType === "ron" && isSeat(from) && from !== seat
+            ? { type: "win", seat, win_type: winType, from_seat: from }
+            : { type: "win", seat, win_type: winType });
+        }
+        break;
+      case "draw": result.push({ type: "draw" }); break;
+      case "hand_start": result.push({ type: "hand_start" }); break;
+      case "hand_end": result.push({ type: "hand_end" }); break;
+      case "score_change":
+        if (isSeat(seat)) result.push({ type: "score_change", seat });
+        break;
+      // No unknown types or unknown keys are forwarded.
+    }
+  }
+  return result;
 }
 
 export class RoomDO extends DurableObject {
@@ -493,6 +894,7 @@ export class RoomDO extends DurableObject {
         sql.exec(
           "CREATE UNIQUE INDEX IF NOT EXISTS cheers_nonce_idx ON cheers (spectator_id, nonce)",
         );
+        sql.exec("CREATE INDEX IF NOT EXISTS cheers_seat_seq_idx ON cheers (target_seat, id)");
         // One moderation vote per credential identity and cheer. Old data stays intact.
         sql.exec(
           "CREATE TABLE IF NOT EXISTS cheer_flags (cheer_id INTEGER NOT NULL, participant_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (cheer_id, participant_id))",
@@ -508,11 +910,23 @@ export class RoomDO extends DurableObject {
         sql.exec(
           "CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL, kind TEXT NOT NULL, snapshot TEXT NOT NULL, created_at INTEGER NOT NULL)",
         );
+        // NULL on old rows is intentional: do not reconstruct historical
+        // reactions from full-information archives or replay old SE on rollout.
+        const eventCols = new Set(sql.exec("PRAGMA table_info(events)")
+          .toArray().map((row: Record<string, unknown>) => String(row.name)));
+        if (!eventCols.has("watch_signals")) {
+          sql.exec("ALTER TABLE events ADD COLUMN watch_signals TEXT");
+        }
         // Paipu archive: the same archival snapshots as events, keyed by
         // match and exempt from the RETAIN_EVENTS trim so a finished match
         // can be exported whole (see PAIPU.md). Pruned per finished match.
         sql.exec(
           "CREATE TABLE IF NOT EXISTS paipu_events (match_key TEXT NOT NULL, seq INTEGER NOT NULL, revision INTEGER NOT NULL, kind TEXT NOT NULL, snapshot TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (match_key, seq))",
+        );
+        // Completed hands only. Do not copy an unfinished master-view snapshot
+        // into this table; it is intentionally readable by every room role.
+        sql.exec(
+          "CREATE TABLE IF NOT EXISTS finished_hands (id INTEGER PRIMARY KEY AUTOINCREMENT, match_key TEXT NOT NULL, hand_key TEXT NOT NULL, revision INTEGER NOT NULL, ended_at INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(match_key, hand_key))",
         );
 
         // Phase R2: independent ownership from Phase-4 credential membership.
@@ -650,6 +1064,19 @@ export class RoomDO extends DurableObject {
 
   private metaDelete(key: string): void {
     this.ctx.storage.sql.exec("DELETE FROM meta WHERE key = ?", key);
+  }
+
+  /** Called inside the existing write transactions. No occupancy work on GET. */
+  private matchBegunForOccupancy(game: Game | null): boolean {
+    return game !== null && game.phase !== "finished" &&
+      game.discards.some(d => d.length > 0);
+  }
+
+  private bumpOccupancyRevisionTx(): void {
+    const raw = Number(this.metaGet("occupancy_revision") ?? "0");
+    const current = isInt(raw) && raw >= 0 ? raw : 0;
+    if (!Number.isSafeInteger(current + 1)) throw new Error("occupancy revision overflow");
+    this.metaSet("occupancy_revision", String(current + 1));
   }
 
   private opsLog(kind: string, payload: unknown): void {
@@ -887,6 +1314,9 @@ export class RoomDO extends DurableObject {
     const snapshotBytes = new TextEncoder().encode(snapshot).byteLength;
     this.ctx.storage.transactionSync(() => {
       this.metaSet("game", snapshot);
+      if (this.matchBegunForOccupancy(previous) !== this.matchBegunForOccupancy(next)) {
+        this.bumpOccupancyRevisionTx();
+      }
       if (previous?.phase === "finished" && next.phase !== "finished") {
         const currentGeneration = Number(this.metaGet("ranking_generation") ?? "0");
         if (!isInt(currentGeneration) || currentGeneration < 0 ||
@@ -1076,6 +1506,9 @@ export class RoomDO extends DurableObject {
       this.metaSet("last_alarm_at", String(now));
       if (snapshot !== null && next !== null) {
         this.metaSet("game", snapshot);
+        if (this.matchBegunForOccupancy(old) !== this.matchBegunForOccupancy(next)) {
+          this.bumpOccupancyRevisionTx();
+        }
         if (typeof next.decision_id === "string") {
           this.ctx.storage.sql.exec("DELETE FROM leases WHERE decision_id <> ?", next.decision_id);
         } else {
@@ -1099,17 +1532,252 @@ export class RoomDO extends DurableObject {
   }
 
 
+  /** Watch watermarks advance in the SAME committed event transaction as the
+   *  Game snapshot. Claim leases do not create a new decision or watermark. */
+  private updateDecisionWatermarksTx(next: Game, timeOffsetMs: number): void {
+    const active = next.phase === "finished" ? [] : currentDecisions(next);
+    for (let seat = 0; seat < 4; seat++) {
+      const pending = active.some(d => d.seat === seat);
+      const deadlineRow = next.clock === null ? null :
+        (next.dec_deadlines as Record<string, unknown>)[String(seat)];
+      const deadline = pending && isObject(deadlineRow) && isInt(deadlineRow.deadline)
+        ? deadlineRow.deadline : null;
+      const signature = pending ? JSON.stringify([next.decision_id, deadline]) : "null";
+      if (this.metaGet(`watch_decision_sig:${seat}`) !== signature) {
+        this.metaSet(`watch_decision_sig:${seat}`, signature);
+        this.metaSet(`watch_decision_changed_at:${seat}`, String(Date.now() + timeOffsetMs));
+      }
+    }
+  }
+
+  /** Persist the first *verified* score baseline for a new hand. Migration in
+   *  the middle of an existing hand deliberately leaves the baseline unknown. */
+  private trackHandScoreBaselineTx(snapshot: JsonObject, matchKey: string, kind: string): void {
+    const hand = handIdentifier(snapshot);
+    const scores = fourScores(snapshot.scores);
+    if (hand === null || scores === null) return;
+    const key = `${matchKey}/${hand}`;
+    const raw = this.metaGet("finished_hand_score_track");
+    let old: JsonObject | null = null;
+    if (raw !== null) {
+      try { const parsed: unknown = JSON.parse(raw); if (isObject(parsed)) old = parsed; }
+      catch { /* corrupt cache is not proof of a baseline */ }
+    }
+    if (old?.key === key) return;
+    // Only init or a witnessed change from a previous hand proves this is a
+    // hand-start score, rather than the middle of an upgraded live game.
+    const trusted = kind === "init" || (old !== null && typeof old.key === "string");
+    this.metaSet("finished_hand_score_track", JSON.stringify({ key, scores, trusted }));
+  }
+
+  /** Construct an allowlisted terminal projection; null means NOT PROVEN to
+   *  be a completed hand with all four end-of-hand concealed tile arrays. */
+  private finishedHandProjection(snapshot: unknown, matchKey: string, revision: number,
+                                 endedAt: number, useTrackedBaseline: boolean): JsonObject | null {
+    if (!isObject(snapshot)) return null;
+    const finished = terminalHandSnapshot(snapshot);
+    if (finished === null) return null;
+    // A terminal nested hand must supply ITS OWN hands. Falling back to the
+    // root's new hand would accidentally reveal ongoing concealed tiles.
+    const hands = finished.hands;
+    // A nested finished hand may belong to the PREVIOUS hand while the root
+    // already describes the next active hand. Never borrow its live scores.
+    const resultScores = isObject(finished.result) ? fourScores(finished.result.scores_after) : null;
+    const scores = fourScores(finished.scores) ?? resultScores ??
+      (finished === snapshot || snapshot.phase === "finished" ? fourScores(snapshot.scores) : null);
+    if (!Array.isArray(hands) || hands.length !== 4 || !hands.every(Array.isArray) ||
+        scores === null) return null;
+    const handKey = handIdentifier(finished) ?? handIdentifier(snapshot) ?? `revision:${revision}`;
+    let before: number[] | null = null;
+    if (useTrackedBaseline) {
+      const trackedText = this.metaGet("finished_hand_score_track");
+      if (trackedText !== null) {
+        try {
+          const tracked: unknown = JSON.parse(trackedText);
+          if (isObject(tracked) && tracked.key === `${matchKey}/${handKey}` &&
+              tracked.trusted === true) before = fourScores(tracked.scores);
+        } catch { /* leave unknown rather than invent score changes */ }
+      }
+    }
+    const result = isObject(finished.result) ? cleanResult(finished.result, true) : null;
+    const round = finished.round ?? snapshot.round ?? null;
+    const handIndex = finished.hand_index ?? snapshot.hand_index;
+    const handId = finished.hand_id ?? snapshot.hand_id;
+    return {
+      schema_version: 1,
+      match_key: matchKey,
+      hand_key: handKey,
+      hand_id: typeof handId === "string" || isInt(handId) ? handId : null,
+      hand_index: isInt(handIndex) ? handIndex : null,
+      round,
+      round_wind: finished.round_wind ?? snapshot.round_wind ?? null,
+      round_number: finished.round_number ?? snapshot.round_number ?? null,
+      round_label: finished.round_label ?? snapshot.round_label ?? null,
+      honba: finished.honba ?? snapshot.honba ?? null,
+      revision,
+      ended_at: endedAt,
+      final_hands: hands,
+      final_hand_names: Array.isArray(finished.hand_names) && finished.hand_names.length === 4
+        ? finished.hand_names : null,
+      final_melds: Array.isArray(finished.melds) && finished.melds.length === 4
+        ? finished.melds : null,
+      final_drawn_tiles: Array.isArray(finished.drawn_tiles) && finished.drawn_tiles.length === 4
+        ? finished.drawn_tiles : null,
+      result: result ?? null,
+      scores_before: before,
+      score_changes: before === null ? null : scores.map((v, i) => v - before![i]),
+      final_scores: scores,
+    };
+  }
+
+  /** Archive only terminal snapshots, atomically with the existing event. */
+  private archiveFinishedHandTx(snapshot: JsonObject, next: Game, kind: string, endedAt: number): void {
+    const matchKey = this.rankingMatchKey(next);
+    // Project before changing the hand-start marker: nested finished hand N
+    // can arrive together with the start of active hand N+1.
+    const hand = this.finishedHandProjection(snapshot, matchKey, next.revision, endedAt, true);
+    this.trackHandScoreBaselineTx(snapshot, matchKey, kind);
+    if (hand === null) return;
+    this.ctx.storage.sql.exec(
+      "INSERT OR IGNORE INTO finished_hands (match_key, hand_key, revision, ended_at, payload) VALUES (?, ?, ?, ?, ?)",
+      matchKey, String(hand.hand_key), next.revision, endedAt, JSON.stringify(hand),
+    );
+    // Keep only a bounded archive; paipu's own retention is not changed.
+    this.ctx.storage.sql.exec(
+      "DELETE FROM finished_hands WHERE id NOT IN (SELECT id FROM finished_hands ORDER BY id DESC LIMIT ?)",
+      FINISHED_HAND_RETAINED,
+    );
+  }
+
+  /** Player-only, tiny per-seat polling surface. Watermarks and counts contain
+   *  no tile, action, lease token, commenter identity or comment body. */
+  private async handleWatchDigest(request: Request, who: Principal): Promise<Response> {
+    if (who.role !== "player" || who.seat === null) return json({ error: "forbidden" }, 403);
+    if (!this.canOperateSeat(who, who.seat)) return json({ error: "not current seat holder" }, 403);
+    const url = new URL(request.url);
+    const after = parseCursor(url);
+    const cheersAfter = parseCursorParam(url, "cheers_after");
+    if (after === null) return json({ error: "invalid after cursor" }, 400);
+    if (cheersAfter === null) return json({ error: "invalid cheers_after cursor" }, 400);
+    // Avoid cloning the entire Game on every cheap poll. The existing Alarm
+    // handles future deadlines; only a due clock needs lazy settlement now.
+    const nextDeadline = this.nextEngineDeadline();
+    const due = nextDeadline !== null && nextDeadline <= this.engineNow();
+    const settled = due ? this.settleNow("lazy_settle") : false;
+    await this.syncIfNeeded(settled);
+    // Engine decisions are queried only for this authenticated, held seat.
+    this.injectTime();
+    const game = this.game!;
+    const seat = who.seat;
+    const active = game.phase !== "finished" && currentDecisions(game).some(d => d.seat === seat);
+    const row = game.clock === null ? null :
+      (game.dec_deadlines as Record<string, unknown>)[String(seat)];
+    const deadline = active && isObject(row) && isInt(row.deadline) ? row.deadline : null;
+    const bounds = this.ctx.storage.sql.exec(
+      "SELECT MIN(seq) AS earliest, MAX(seq) AS latest FROM events",
+    ).toArray()[0];
+    const earliest = bounds?.earliest === null || bounds === undefined ? 0 : Number(bounds.earliest);
+    const latest = bounds?.latest === null || bounds === undefined ? 0 : Number(bounds.latest);
+    const deferred = this.policy.raw_mode && this.policy.defer_during_raw_decision && active;
+    let ownCheerCount = 0;
+    let cheerLatest: number | null = null;
+    if (!deferred) {
+      const cheerBound = this.ctx.storage.sql.exec(
+        "SELECT MAX(id) AS n FROM cheers WHERE target_seat = ?", seat,
+      ).toArray()[0];
+      cheerLatest = cheerBound?.n === null || cheerBound === undefined ? 0 : Number(cheerBound.n);
+      // Most polls have no new cheer. Avoid scanning/comment-counting them.
+      if (cheerLatest > cheersAfter) {
+        const cheers = this.ctx.storage.sql.exec(
+          "SELECT COUNT(*) AS n FROM cheers c JOIN credentials p ON p.participant_id = c.spectator_id WHERE c.target_seat = ? AND c.id > ? AND c.hidden = 0",
+          seat, cheersAfter,
+        ).toArray()[0];
+        ownCheerCount = Number(cheers?.n ?? 0);
+      }
+    }
+    const changedRaw = this.metaGet(`watch_decision_changed_at:${seat}`);
+    const changed = changedRaw === null ? null : Number(changedRaw);
+    return json({
+      revision: game.revision,
+      latest_seq: latest,
+      earliest_events_seq: earliest,
+      latest_events_seq: latest,
+      events_cursor_expired: earliest > 1 && after < earliest - 1,
+      own_decision: active ? { id: game.decision_id, deadline } : null,
+      decision_changed_at: changed !== null && isInt(changed) ? changed : null,
+      own_cheer_new_count: ownCheerCount,
+      cheers_latest_seq_for_seat: cheerLatest,
+      cheers_deferred: deferred,
+      occupancy_revision: Number(this.metaGet("occupancy_revision") ?? "0"),
+      server_time: this.engineNow(),
+    });
+  }
+
+  /** Expose only an archived terminal hand, never this.game's active hands. */
+  private async handleHandsLatest(who: Principal): Promise<Response> {
+    if (who.role !== "player" && who.role !== "spectator" && who.role !== "master") {
+      return json({ error: "forbidden" }, 403);
+    }
+    const saved = this.ctx.storage.sql.exec(
+      "SELECT payload, ended_at FROM finished_hands ORDER BY id DESC LIMIT 1",
+    ).toArray()[0];
+    let latest: JsonObject | null = null;
+    let latestAt = -1;
+    if (saved !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(String(saved.payload));
+        if (isObject(parsed) && Array.isArray(parsed.final_hands) && parsed.final_hands.length === 4) {
+          latest = parsed;
+          latestAt = Number(saved.ended_at);
+        }
+      } catch { /* corrupt historical row is not disclosed */ }
+    }
+    // Pre-upgrade finished matches have paipu snapshots but no finished_hands
+    // rows. Only the registered FINISHED match's terminal archive is eligible.
+    const archived = this.ctx.storage.sql.exec(
+      `SELECT p.match_key, p.revision, p.created_at, p.snapshot
+       FROM paipu_events p JOIN ranking_matches m ON m.match_key = p.match_key
+       ORDER BY p.created_at DESC, p.seq DESC LIMIT 1`,
+    ).toArray()[0];
+    if (archived !== undefined && Number(archived.created_at) > latestAt) {
+      let record: JsonObject | null = null;
+      try {
+        const snapshot: unknown = JSON.parse(String(archived.snapshot));
+        record = this.finishedHandProjection(snapshot, String(archived.match_key),
+          Number(archived.revision), Number(archived.created_at), false);
+      } catch { /* fail closed on legacy snapshots */ }
+      if (record !== null) latest = record;
+    }
+    return latest === null ? json({ error: "no_finished_hand" }, 404) : json(latest);
+  }
+
   /** Only public, allowlisted fields enter the event-history projection. */
   private appendEvent(next: Game, kind: string, policy: RoomPolicy = this.policy,
-                      timeOffsetMs = this.timeOffsetMs): void {
+                      timeOffsetMs = this.timeOffsetMs, actionHint?: unknown): void {
     this.injectTime(timeOffsetMs);
     const raw: unknown = publicState(next);
     const archival = viewState(raw, { role: "master", seat: null }, policy);
     const snapshotJson = JSON.stringify(archival);
+    // Use a second, restricted spectator projection ONLY for classification.
+    // The previous full-information archive never crosses the HTTP boundary.
+    const previous = this.ctx.storage.sql.exec(
+      "SELECT snapshot FROM events ORDER BY seq DESC LIMIT 1",
+    ).toArray()[0];
+    let publicSignals: WatchSignal[] = [];
+    try {
+      const before = previous === undefined ? null :
+        soundView(JSON.parse(String(previous.snapshot)) as unknown, policy);
+      publicSignals = makeWatchSignals(before, soundView(archival, policy), kind, actionHint);
+    } catch {
+      // A cosmetic sound feature must NEVER cause a valid game commit to fail.
+      // An unexpected engine format simply produces a silent event.
+    }
     const createdAt = Date.now();
+    this.updateDecisionWatermarksTx(next, timeOffsetMs);
+    this.archiveFinishedHandTx(archival, next, kind, createdAt);
     this.ctx.storage.sql.exec(
-      "INSERT INTO events (revision, kind, snapshot, created_at) VALUES (?, ?, ?, ?)",
-      next.revision, kind, snapshotJson, createdAt,
+      "INSERT INTO events (revision, kind, snapshot, created_at, watch_signals) VALUES (?, ?, ?, ?, ?)",
+      next.revision, kind, snapshotJson, createdAt, JSON.stringify(publicSignals),
     );
     const last = this.ctx.storage.sql.exec("SELECT MAX(seq) AS n FROM events").toArray()[0];
     if (last) {
@@ -1199,6 +1867,13 @@ export class RoomDO extends DurableObject {
     const pid = "watch:" + client;
     const tokenHash = await sha256Hex("watch-cheer:" + client);
     this.ctx.storage.transactionSync(() => {
+      const old = this.ctx.storage.sql.exec(
+        "SELECT seat, display_name, enabled FROM credentials WHERE participant_id = ?", pid,
+      ).toArray()[0];
+      if (!old || old.seat === null || Number(old.seat) !== seat ||
+          String(old.display_name) !== name || Number(old.enabled) !== 1) {
+        this.bumpOccupancyRevisionTx();
+      }
       this.ctx.storage.sql.exec(
         `INSERT INTO credentials (token_hash, participant_id, role, seat, display_name, created_at)
          VALUES (?, ?, 'spectator', ?, ?, ?)
@@ -1245,10 +1920,7 @@ export class RoomDO extends DurableObject {
    * provisional holder never polled queue-status, so no Player credential
    * was ever issued — returns to 'waiting'; a redeemed claim is closed as
    * 'left'. Callers invoke this AFTER promoteWaitingTx() so a reverted
-   * row is not instantly re-promoted into the seat just vacated. Without
-   * this, the queue row stayed 'promoted' forever once its holder was
-   * gone: queue-status 409-looped, queue-leave rejected it as already
-   * promoted, and re-queueing returned the stale row.
+   * row is not instantly re-promoted into the seat just vacated. (PR #2)
    */
   private settleQueueClaimTx(seat: number, participantId: string): void {
     const row = this.ctx.storage.sql.exec(
@@ -1300,6 +1972,7 @@ export class RoomDO extends DurableObject {
         seat, participant, salt, now, id,
       );
       this.opsLog("queue_promoted", { queue_id: id, seat, participant_id: participant });
+      this.bumpOccupancyRevisionTx();
       promoted++;
     }
     return promoted;
@@ -1399,6 +2072,7 @@ export class RoomDO extends DurableObject {
       );
       const id = Number(this.ctx.storage.sql.exec("SELECT last_insert_rowid() AS id").toArray()[0].id);
       this.opsLog("queue_joined", { queue_id: id });
+      this.bumpOccupancyRevisionTx();
       this.promoteWaitingTx();
       const row = this.queueEntry(hash)!;
       data = { queue_token: token, status: row.status, position:
@@ -1436,10 +2110,10 @@ export class RoomDO extends DurableObject {
       if (!fresh || fresh.status !== "promoted" || !holder ||
           holder.participant_id !== row.participant_id ||
           (holder.token_hash !== secret.hash && holder.token_hash !== playerHash)) {
-        // Legacy orphan: the claim ended before redemption and the row was
-        // stranded in 'promoted' (see settleQueueClaimTx). If no Player
-        // credential was ever issued for it, return it to 'waiting'
-        // instead of 409-looping the owner forever.
+        // Legacy orphan: the claim ended before redemption and the row
+        // was stranded in 'promoted' (see settleQueueClaimTx). If no
+        // Player credential was ever issued for it, return it to
+        // 'waiting' instead of 409-looping the owner forever. (PR #2)
         if (fresh && fresh.status === "promoted" && fresh.player_token_hash === null) {
           this.revertQueuePromotionTx(fresh.id, row.seat, "queue-status");
           reverted = true;
@@ -1460,6 +2134,7 @@ export class RoomDO extends DurableObject {
           "UPDATE rotation_queue SET player_token_hash = ? WHERE id = ?", playerHash, row.id,
         );
         this.opsLog("queue_credential_issued", { queue_id: row.id, seat: row.seat });
+        this.bumpOccupancyRevisionTx();
       }
     });
     if (reverted) {
@@ -1489,6 +2164,7 @@ export class RoomDO extends DurableObject {
         "UPDATE rotation_queue SET status = 'left', left_at = ? WHERE id = ?", Date.now(), row.id,
       );
       this.opsLog("queue_left", { queue_id: row.id });
+      this.bumpOccupancyRevisionTx();
       data = { ok: true, left: true };
     });
     return json(data, status);
@@ -1514,6 +2190,7 @@ export class RoomDO extends DurableObject {
       this.metaSet(`proxy_active:${seat}`, "0");
       this.metaSet(`proxy_count:${seat}`, "0");
       this.opsLog("player_left", { participant_id: who.participant_id, seat });
+      this.bumpOccupancyRevisionTx();
       const promoted = this.promoteWaitingTx();
       this.settleQueueClaimTx(seat, who.participant_id);
       data = { ok: true, seat, open: this.currentHolder(seat) === null, promoted: promoted > 0 };
@@ -1547,7 +2224,65 @@ export class RoomDO extends DurableObject {
       this.metaSet(`proxy_active:${seat}`, parsed.active ? "1" : "0");
       this.metaSet(`proxy_count:${seat}`, "0");
       this.opsLog(parsed.active ? "proxy_declared" : "proxy_cleared", { participant_id: who.participant_id, seat });
+      this.bumpOccupancyRevisionTx();
       data = { ok: true, seat, proxy_active: parsed.active, proxy_plays: 0, proxy_max_plays: PROXY_MAX_PLAYS };
+    });
+    return json(data, status);
+  }
+
+
+  /** Self-service profile update: a joined player or spectator may change
+   * their own display_name / icon / avatar_url. The avatar_url is shown on
+   * the watch page and later carries tiles on the presentation layer.
+   * Bootstrap and master principals have no editable profile row. */
+  private async handleProfile(request: Request, who: Principal): Promise<Response> {
+    if ((who.role !== "player" && who.role !== "spectator") ||
+        who.participant_id.startsWith("bootstrap:")) {
+      return json({ error: "only joined participants may update their profile" }, 403);
+    }
+    const parsed = await readJsonObject(request);
+    if (parsed instanceof Response) return parsed;
+    const hasName = parsed.display_name !== undefined;
+    const hasIcon = parsed.icon !== undefined;
+    const hasAvatar = parsed.avatar_url !== undefined;
+    if (!hasName && !hasIcon && !hasAvatar) return json({ error: "nothing to update" }, 400);
+    if (hasName) {
+      const nameError = validateName(parsed.display_name, "display_name");
+      if (nameError) return json({ error: nameError }, 400);
+    }
+    if (hasIcon && parsed.icon !== null &&
+        (typeof parsed.icon !== "string" || Array.from(parsed.icon).length > 12)) {
+      return json({ error: "invalid icon" }, 400);
+    }
+    if (hasAvatar && !validateAvatarUrl(parsed.avatar_url)) {
+      return json({ error: "invalid avatar_url" }, 400);
+    }
+    let status = 200;
+    let data: JsonObject = {};
+    this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql.exec(
+        "SELECT display_name, icon, avatar_url FROM credentials WHERE participant_id = ? AND enabled = 1",
+        who.participant_id,
+      ).toArray()[0];
+      if (!row) { status = 404; data = { error: "profile not found" }; return; }
+      const name = hasName ? String(parsed.display_name).trim() : String(row.display_name);
+      const icon = hasIcon
+        ? (parsed.icon === null ? null : String(parsed.icon))
+        : (row.icon === null || row.icon === undefined ? null : String(row.icon));
+      const avatar = hasAvatar
+        ? (parsed.avatar_url === null ? null : String(parsed.avatar_url))
+        : (row.avatar_url === null || row.avatar_url === undefined ? null : String(row.avatar_url));
+      this.ctx.storage.sql.exec(
+        "UPDATE credentials SET display_name = ?, icon = ?, avatar_url = ? WHERE participant_id = ?",
+        name, icon, avatar, who.participant_id,
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE rotation_queue SET display_name = ?, icon = ? WHERE participant_id = ? AND status = 'promoted'",
+        name, icon, who.participant_id,
+      );
+      this.opsLog("profile_updated", { participant_id: who.participant_id });
+      this.bumpOccupancyRevisionTx();
+      data = { ok: true, display_name: name, icon, avatar_url: avatar };
     });
     return json(data, status);
   }
@@ -1585,9 +2320,79 @@ export class RoomDO extends DurableObject {
     this.metaSet(`proxy_active:${seat}`, "0");
     this.metaSet(`proxy_count:${seat}`, "0");
     this.opsLog("seat_vacated", { participant_id: holder.participant_id, seat });
+    this.bumpOccupancyRevisionTx();
     const promoted = this.promoteWaitingTx();
     this.settleQueueClaimTx(seat, holder.participant_id);
     return { vacated: true, promoted };
+  }
+
+  /**
+   * POST /rematch — start the next match in this room (a room otherwise
+   * hosts exactly one match). Master or a current seat holder may call it,
+   * only while the current match is finished. When the waiting queue is
+   * non-empty, seats first rotate (match-end relay): bot seats yield first,
+   * then the longest-held seats, one per waiting person; each vacated seat
+   * is refilled from the queue by the usual FIFO promotion. Yielded players
+   * lose their credential (as with leave) and may queue again at the tail.
+   * Unredeemed promotions never block the start: the seat is covered by the
+   * usual fill-in play until the holder redeems and takes over.
+   */
+  private async handleRematch(request: Request, who: Principal): Promise<Response> {
+    if (this.game === null) return json({ error: "room not initialized" }, 404);
+    if (who.role !== "master" && who.role !== "player") {
+      return json({ error: "forbidden" }, 403);
+    }
+    if (who.role === "player") {
+      // The current holder may call it; a registered player of a seat with
+      // no holder (e.g. a bootstrap seat never claimed through rotation)
+      // speaks for that seat as well.
+      const holder = who.seat === null ? null : this.currentHolder(who.seat);
+      const isHolder = holder !== null && holder.participant_id === who.participant_id;
+      if (!isHolder && holder !== null) {
+        return json({ error: "not a current seat holder" }, 403);
+      }
+      if (who.seat === null) return json({ error: "not a current seat holder" }, 403);
+    }
+    if (this.game.phase !== "finished") {
+      return json({ error: "match in progress" }, 409);
+    }
+    const ruleset = this.game.ruleset;
+    const seed = Math.floor(Math.random() * 1_000_000_000);
+    const rotated: number[] = [];
+    let promotedCount = 0;
+    const nextBox: { game: Game | null } = { game: null };
+    this.ctx.storage.transactionSync(() => {
+      const waitingRow = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM rotation_queue WHERE status = 'waiting'",
+      ).toArray()[0];
+      const waiting = waitingRow ? Number(waitingRow.n) : 0;
+      if (waiting > 0) {
+        const holders = this.ctx.storage.sql.exec(
+          "SELECT seat, source, assigned_at FROM rotation_seat_holders ORDER BY seat",
+        ).toArray().map(r => ({ seat: Number(r.seat), source: String(r.source),
+          assigned_at: Number(r.assigned_at) }));
+        holders.sort((a, b) =>
+          (a.source === "bot" ? 0 : 1) - (b.source === "bot" ? 0 : 1) ||
+          a.assigned_at - b.assigned_at);
+        for (const h of holders.slice(0, Math.min(waiting, holders.length))) {
+          const r = this.vacateSeatTx(h.seat);
+          if (r.vacated) { rotated.push(h.seat); promotedCount += r.promoted; }
+        }
+        if (rotated.length === 0) promotedCount += this.promoteWaitingTx();
+      }
+      nextBox.game = newGame(seed, ruleset);
+      this.ctx.storage.sql.exec("DELETE FROM leases");
+      this.metaSet("game", JSON.stringify(nextBox.game));
+      this.appendEvent(nextBox.game, "rematch");
+      this.bumpOccupancyRevisionTx();
+      this.opsLog("rematch_started", { rotated_seats: rotated, promoted: promotedCount });
+    });
+    if (nextBox.game === null) return json({ error: "rematch failed" }, 500);
+    this.game = nextBox.game;
+    this.savedRevision = nextBox.game.revision;
+    await this.syncAlarmSafely();
+    return json({ ok: true, rotated_seats: rotated, promoted: promotedCount,
+      phase: nextBox.game.phase });
   }
 
   private async handleWatchPassword(request: Request, who: Principal): Promise<Response> {
@@ -1610,7 +2415,7 @@ export class RoomDO extends DurableObject {
    * this projection. The same result is returned to all viewer roles.
    */
   private occupancySummary(): JsonObject {
-    type PublicPlayer = { display_name: string; icon: string | null };
+    type PublicPlayer = { display_name: string; icon: string | null; avatar_url: string | null };
     type SeatSummary = {
       seat: number;
       joined: boolean;
@@ -1619,6 +2424,7 @@ export class RoomDO extends DurableObject {
       icon: string | null;
       participant_count: number;
       participants: PublicPlayer[];
+      avatar_url: string | null;
       open: boolean;
       proxy: boolean;
       proxy_plays: number;
@@ -1627,7 +2433,7 @@ export class RoomDO extends DurableObject {
 
     const seats: SeatSummary[] = Array.from({ length: 4 }, (_, seat) => ({
       seat, joined: false, in_match: false, display_name: null, icon: null,
-      participant_count: 0, participants: [], open: this.currentHolder(seat) === null,
+      participant_count: 0, participants: [], avatar_url: null, open: this.currentHolder(seat) === null,
       proxy: this.metaGet(`proxy_active:${seat}`) === "1",
       proxy_plays: Number(this.metaGet(`proxy_count:${seat}`) ?? "0"),
     }));
@@ -1637,7 +2443,7 @@ export class RoomDO extends DurableObject {
     let spectatorTotal = 0;
 
     const rows = this.ctx.storage.sql.exec(
-      "SELECT participant_id, role, seat, display_name, icon FROM credentials " +
+      "SELECT participant_id, role, seat, display_name, icon, avatar_url FROM credentials " +
       "WHERE enabled = 1 AND role IN ('player', 'spectator') " +
       "ORDER BY created_at, participant_id",
     ).toArray();
@@ -1646,16 +2452,18 @@ export class RoomDO extends DurableObject {
       const seat = row.seat === null ? null : Number(row.seat);
       const name = String(row.display_name);
       const icon = row.icon === null || row.icon === undefined ? null : String(row.icon);
+      const avatarUrl = row.avatar_url === null || row.avatar_url === undefined ? null : String(row.avatar_url);
       if (role === "player") {
         // A bootstrap credential is NEVER evidence that a Muse joined.
         if (String(row.participant_id).startsWith("bootstrap:") || !isSeat(seat)) continue;
         const item = seats[seat];
-        item.participants.push({ display_name: name, icon });
+        item.participants.push({ display_name: name, icon, avatar_url: avatarUrl });
         item.participant_count += 1;
         if (!item.joined) {
           item.joined = true;
           item.display_name = name;
           item.icon = icon;
+          item.avatar_url = avatarUrl;
         }
       } else if (role === "spectator") {
         spectatorTotal += 1;
@@ -1697,6 +2505,49 @@ export class RoomDO extends DurableObject {
     return result;
   }
 
+  /**
+   * GET /rooms/:id/watch-events?tail=1 OR ?after=N.
+   * Authentication is performed by fetch() (enabled token or watch password).
+   * Every returned field is independently constructed from a fixed allowlist.
+   * Only publicly discarded tiles plus categorical animation signals.
+   * Never a private drawn tile, concealed hand, full snapshot or decision.
+   */
+  private async handleWatchEvents(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const tail = url.searchParams.get("tail");
+    if (tail !== null && (tail !== "1" || url.searchParams.has("after"))) {
+      return json({ error: "invalid tail cursor" }, 400);
+    }
+    const after = tail === null ? parseCursor(url) : 0;
+    if (after === null) return json({ error: "invalid after cursor" }, 400);
+    const settled = this.settleNow("lazy_settle");
+    await this.syncIfNeeded(settled);
+    const bounds = this.ctx.storage.sql.exec(
+      "SELECT MIN(seq) AS first_seq, MAX(seq) AS last_seq FROM events",
+    ).toArray()[0];
+    const earliest = bounds?.first_seq == null ? 0 : Number(bounds.first_seq);
+    const serverLatest = bounds?.last_seq == null ? 0 : Number(bounds.last_seq);
+    if (tail === "1") {
+      return json({ events: [], latest_seq: serverLatest,
+        server_latest_seq: serverLatest, has_more: false });
+    }
+    if (earliest > 1 && after < earliest - 1) {
+      return json({ error: "EVENT_CURSOR_EXPIRED", snapshot_required: true,
+        latest_seq: serverLatest }, 409);
+    }
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT seq, revision, watch_signals FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
+      after, MAX_EVENTS_PAGE,
+    ).toArray();
+    const events = rows.map(row => ({
+      seq: Number(row.seq), revision: Number(row.revision),
+      signals: readWatchSignals(row.watch_signals),
+    }));
+    const cursor = events.length ? events[events.length - 1].seq : after;
+    return json({ events, latest_seq: cursor,
+      server_latest_seq: serverLatest, has_more: cursor < serverLatest });
+  }
+
   private async handleEvents(request: Request, who: Principal): Promise<Response> {
     const after = parseCursor(new URL(request.url));
     if (after === null) return json({ error: "invalid after cursor" }, 400);
@@ -1734,10 +2585,11 @@ export class RoomDO extends DurableObject {
    * progress is never exportable. Any enabled credential may download.
    *
    * With ?list=1 the endpoint instead returns a JSON index of recorded
-   * finished matches (newest first), so a reader can discover match keys
-   * and pick one: { matches: [{ match_key, finished_at, event_count,
-   * paipu_available, results }] }. event_count is 0 once the archive has
-   * been pruned by the retention policy (paipu_available: false).
+   * finished matches (newest first, at most 50), so a reader can discover
+   * match keys and pick one: { matches: [{ match_key, finished_at,
+   * event_count, paipu_available, results }] }. event_count is 0 once the
+   * archive has been pruned by the retention policy (paipu_available:
+   * false). Ported from PR #3 (neon-joshu).
    */
   private async handlePaipu(request: Request, who: Principal): Promise<Response> {
     const params = new URL(request.url).searchParams;
@@ -2035,8 +2887,8 @@ export class RoomDO extends DurableObject {
         this.promoteWaitingTx(); // FIFO has priority over a late direct invite.
         if (this.currentHolder(seat) === null) {
           this.ctx.storage.sql.exec(
-            "INSERT INTO rotation_seat_holders (seat, participant_id, token_hash, assigned_at, source) VALUES (?, ?, ?, ?, 'invite')",
-            seat, pid, hash, now,
+            "INSERT INTO rotation_seat_holders (seat, participant_id, token_hash, assigned_at, source) VALUES (?, ?, ?, ?, ?)",
+            seat, pid, hash, now, parsed.bot === true ? "bot" : "invite",
           );
           this.metaSet(`timeout_streak:${seat}`, "0");
           this.metaSet(`rotation_grace:${seat}`, "1");
@@ -2045,6 +2897,7 @@ export class RoomDO extends DurableObject {
         }
       }
       this.opsLog("participant_joined", { participant_id: pid, role, seat });
+      this.bumpOccupancyRevisionTx();
       joined = { role, seat };
     });
     if (!joined) return json({ error: denied }, denied.startsWith("support") ? 403 : 409);
@@ -2070,6 +2923,7 @@ export class RoomDO extends DurableObject {
         hash, pid, seat, String(parsed.display_name).trim(), Date.now(),
       );
       this.opsLog("spectator_created", { participant_id: pid, support_seat: seat });
+      this.bumpOccupancyRevisionTx();
     });
     return json({ participant_id: pid, role: "spectator", support_seat: seat, token }, 201);
   }
@@ -2084,6 +2938,7 @@ export class RoomDO extends DurableObject {
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("UPDATE credentials SET seat = ? WHERE participant_id = ?", seat, who.participant_id);
       this.opsLog("spectator_support_changed", { participant_id: who.participant_id, seat });
+      if (who.seat !== seat) this.bumpOccupancyRevisionTx();
     });
     return json({ ok: true, support_seat: seat });
   }
@@ -2246,7 +3101,8 @@ export class RoomDO extends DurableObject {
         // for a chosen support seat without a registered spectator token.
         principal = await this.watchCheerPrincipal(request);
       }
-      if (!principal && path === "/state" && request.method === "GET") {
+      if (!principal && (path === "/state" || path === "/watch-events") &&
+          request.method === "GET") {
         // Human spectator page: a room watch password grants the outer
         // spectator view (all hands hidden) for state reads only.
         principal = await this.watchPrincipal(request);
@@ -2261,9 +3117,14 @@ export class RoomDO extends DurableObject {
       }
       if (path === "/leave" && request.method === "POST") return await this.handleLeave(principal);
       if (path === "/vacate" && request.method === "POST") return await this.handleVacate(request, principal);
+      if (path === "/rematch" && request.method === "POST") return await this.handleRematch(request, principal);
       if (path === "/proxy" && request.method === "POST") return await this.handleProxy(request, principal);
+      if (path === "/profile" && request.method === "POST") return await this.handleProfile(request, principal);
       if (path === "/state" && request.method === "GET") return await this.handleState(principal);
+      if (path === "/watch-digest" && request.method === "GET") return await this.handleWatchDigest(request, principal);
+      if (path === "/hands/latest" && request.method === "GET") return await this.handleHandsLatest(principal);
       if (path === "/events" && request.method === "GET") return await this.handleEvents(request, principal);
+      if (path === "/watch-events" && request.method === "GET") return await this.handleWatchEvents(request);
       if (path === "/paipu" && request.method === "GET") return await this.handlePaipu(request, principal);
       if (path === "/actions" && request.method === "POST") return await this.handleActions(request, principal);
       if (path === "/claim" && request.method === "POST") return await this.handleClaim(request, principal);
@@ -2347,6 +3208,7 @@ export class RoomDO extends DurableObject {
       }
       this.metaSet("room_id", body.room_id);
       this.metaSet("room_policy", JSON.stringify(policy));
+      this.metaSet("occupancy_revision", "1");
       this.metaSet("time_offset_ms", String(nextOffset));
       this.metaSet("game", snapshot);
       const now = Date.now();
@@ -2455,6 +3317,7 @@ export class RoomDO extends DurableObject {
         // a personal (unmarked) action ends the reservation, and reaching
         // the cap rotates the seat to the queue.
         if (this.metaGet(`proxy_active:${seat}`) === "1") {
+          this.bumpOccupancyRevisionTx();
           if (body.via === "prompt") {
             const plays = Number(this.metaGet(`proxy_count:${seat}`) ?? "0") + 1;
             this.metaSet(`proxy_count:${seat}`, String(plays));
@@ -2566,13 +3429,16 @@ export class RoomDO extends DurableObject {
         if (changed) {
           const snapshot = JSON.stringify(next);
           this.metaSet("game", snapshot);
+          if (this.matchBegunForOccupancy(this.game) !== this.matchBegunForOccupancy(next)) {
+            this.bumpOccupancyRevisionTx();
+          }
           if (typeof next.decision_id === "string") {
             this.ctx.storage.sql.exec("DELETE FROM leases WHERE decision_id <> ?", next.decision_id);
           } else {
             this.ctx.storage.sql.exec("DELETE FROM leases");
           }
           this.opsLog("dev_time_settle", { revision: next.revision, decision_id: next.decision_id });
-          this.appendEvent(next, "dev_time_settle");
+          this.appendEvent(next, "dev_time_settle", this.policy, candidate);
           if (this.game?.phase !== "finished" && next.phase === "finished") {
             this.recordFinishedMatchTx(next);
             this.logCompletionMetrics(new TextEncoder().encode(snapshot).byteLength);

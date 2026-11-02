@@ -37,7 +37,7 @@ except ImportError:
 VERSION = "1.2.0"
 DEFAULT_BASE = "https://muse-jansou.muse-jansou.workers.dev"
 # 参加キット記載のテスト卓。別卓では join --room で上書き可能。
-DEFAULT_ROOM = "a508cc53-02f5-45a2-948e-c6dc56253fb9"
+DEFAULT_ROOM = "c4c3d9be-ed74-458d-8956-11bd345c477c"
 HTTP_TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 # 牌譜（paipu）は半荘分のスナップショット列なので、通常応答より大きい上限を使う。
@@ -81,6 +81,8 @@ def canonical(obj: Any) -> str:
 def tile_name(n: Any) -> str:
     if not is_int(n):
         return "?"
+    if n in (34, 35, 36):
+        return "赤五" + ("萬", "筒", "索")[n - 34]
     if 0 <= n <= 26:
         digit = n % 9
         suit = ("m", "p", "s")[n // 9]
@@ -92,13 +94,15 @@ def tile_name(n: Any) -> str:
 
 
 def tile_code(n: Any) -> str:
+    if is_int(n) and n in (34, 35, 36):
+        return "0" + ("m", "p", "s")[n - 34]  # 赤5は 0m/0p/0s とも書く
     if is_int(n) and 0 <= n <= 26:
         return str(n % 9 + 1) + ("m", "p", "s")[n // 9]
     return tile_name(n)
 
 
 def tile_label(n: Any) -> str:
-    if is_int(n) and 0 <= n <= 33:
+    if is_int(n) and 0 <= n <= 36:
         return "%s(%s:%d)" % (tile_code(n), tile_name(n), n)
     return str(n)
 
@@ -107,9 +111,12 @@ def parse_tile(s: str) -> int:
     raw = s.strip()
     if re.fullmatch(r"\d+", raw):
         n = int(raw)
-        if 0 <= n <= 33:
+        if 0 <= n <= 36:
             return n
-        raise HelperError("牌IDは0～33で指定してください。")
+        raise HelperError("牌IDは0～36で指定してください。")
+    red = re.fullmatch(r"0([mpsMPS])", raw)
+    if red:
+        return 34 + "mps".index(red.group(1).lower())
     match = re.fullmatch(r"([1-9])([mpsMPS])", raw)
     if match:
         return ("mps".index(match.group(2).lower()) * 9 + int(match.group(1)) - 1)
@@ -804,9 +811,15 @@ def cmd_join(args: argparse.Namespace, files: SecureFiles) -> int:
         body = {"invite_code": invite, "display_name": args.name.strip()}
         if args.icon is not None:
             body["icon"] = args.icon
+        if args.avatar_url is not None:
+            body["avatar_url"] = args.avatar_url
         # roleは招待の中に固定済み。join本文へは渡さない（Phase 4契約）。
         if args.role == "spectator" and args.support is not None:
             body["support_seat"] = args.support
+        if getattr(args, "bot", False):
+            # Bot席として参加（サーバー側で保持者の種別が bot になり、
+            # 試合終わりリレーでは人が待っていれば先に席を譲る）。
+            body["bot"] = True
         api = API(base, room_id, None, args.timeout)
         joined = api.call("POST", "join", body)
         token = joined.get("token")
@@ -830,6 +843,7 @@ def cmd_join(args: argparse.Namespace, files: SecureFiles) -> int:
             "display_name": args.name.strip(),
             "icon": args.icon or "",
             "participant_id": joined.get("participant_id"),
+            "bot": bool(getattr(args, "bot", False)),
             "registered_at": utc_timestamp(),
         })
         files.delete("selection.json")
@@ -1167,7 +1181,7 @@ def cmd_events(args: argparse.Namespace, files: SecureFiles) -> int:
 def cmd_paipu(args: argparse.Namespace, files: SecureFiles) -> int:
     with files.lock():
         config, api = load_context(files, args.timeout)
-        if args.list:
+        if getattr(args, "list", False):
             raw = api.call_raw("GET", "paipu", query={"list": "1"})
             try:
                 payload = json.loads(raw.decode("utf-8"))
@@ -1443,6 +1457,526 @@ def cmd_proxy(args: argparse.Namespace, files: SecureFiles) -> int:
     return 0
 
 
+def cmd_avatar(args: argparse.Namespace, files: SecureFiles) -> int:
+    """Register or clear this participant's avatar image URL (self-service)."""
+    with files.lock():
+        config, api = load_context(files, args.timeout)
+        url = args.url.strip()
+        reply = api.call("POST", "profile", {"avatar_url": url if url else None})
+        if reply.get("ok") is not True:
+            raise HelperError("アバター登録の成功応答を確認できません。")
+        if url:
+            print("アバター画像を登録しました: %s" % url)
+            print("観戦ページの席表示に使われます（GIF/WebP等の動画も可）。")
+        else:
+            print("アバター画像の登録を解除しました。")
+    return 0
+
+
+def cmd_rematch(args: argparse.Namespace, files: SecureFiles) -> int:
+    """Start the next match in this room (match-end relay applies)."""
+    with files.lock():
+        config, api = load_context(files, args.timeout)
+        require_role(config, "player", "rematch")
+        reply = api.call("POST", "rematch", {})
+        if reply.get("ok") is not True:
+            raise HelperError("再試合の成功応答を確認できません。")
+        rotated = reply.get("rotated_seats") or []
+        if rotated:
+            print("次の試合を開始しました。待ち列への交代で空いた席: %s" %
+                  ", ".join("席%d" % s for s in rotated))
+        else:
+            print("次の試合を開始しました（交代なし）。")
+        if reply.get("promoted"):
+            print("待ち列から %d 名が昇格しました。" % int(reply["promoted"]))
+    return 0
+
+
+def _bot_conn(tile: int, hand: list) -> int:
+    """How connected a tile is to the rest of the hand (higher = keep).
+
+    赤牌（34/35/36）は通常の5として数える。"""
+    tile = _kind(tile)
+    if tile >= 27:
+        return sum(1 for t in hand if _kind(t) == tile) - 1
+    suit, rank = tile // 9, tile % 9
+    n = 0
+    skipped_self = False
+    for t in hand:
+        t = _kind(t)
+        if t >= 27:
+            continue
+        if t == tile and not skipped_self:
+            skipped_self = True
+            continue
+        if t // 9 == suit and abs(t % 9 - rank) <= 2:
+            n += 1
+    return n
+
+
+def _bot_choose(state: dict, seat: int, actions: list) -> Optional[dict]:
+    """The bot's fixed, simple policy. It plays only its own bot seat."""
+    types = [a.get("type") for a in actions]
+    if "ron" in types:
+        return next(a for a in actions if a.get("type") == "ron")
+    if "tsumo" in types:
+        return next(a for a in actions if a.get("type") == "tsumo")
+    hand = state.get("hands", [None] * 4)[seat]
+    discards = [a for a in actions if a.get("type") == "discard"]
+    if discards and isinstance(hand, list):
+        riichi_opts = [a for a in discards if a.get("riichi_discard") is True]
+        pool = riichi_opts if riichi_opts else discards
+        def key(a):
+            t = a.get("tile")
+            conn = _bot_conn(t, hand) if isinstance(t, int) else 99
+            k = _kind(t) if isinstance(t, int) else None
+            edge = 0 if (k is not None and k >= 27) or (k is not None and k % 9 in (0, 8)) else 1
+            red = 1 if t in (34, 35, 36) else 0  # 同条件なら赤（ドラ）でない方から切る
+            return (conn, edge, red, t if isinstance(t, int) else 99)
+        return min(pool, key=key)
+    # 九種九牌などの流局宣言があれば受ける。鳴き・槓はしない。
+    for a in actions:
+        if a.get("type") not in ("discard", "ankan", "kakan", "chi", "pon"):
+            return a
+    if "pass" in types:
+        return next(a for a in actions if a.get("type") == "pass")
+    return actions[0] if actions else None
+
+
+# ---------- strong bot brain: shanten / ukeire / value / defence ----------
+# Pure computation on the public state (own hand + everything visible).
+# Red tiles (34/35/36, once aka dora ships) count as their normal kind for
+# shape and as dora for value.
+_RED_KIND = {34: 4, 35: 13, 36: 22}
+
+
+def _kind(tile):
+    return _RED_KIND.get(tile, tile)
+
+
+def _counts34(tiles):
+    c = [0] * 34
+    for t in tiles:
+        if isinstance(t, int) and 0 <= t <= 36:
+            c[_kind(t)] += 1
+    return c
+
+
+def _discard_kinds(state, seat):
+    out = []
+    for d in state.get("discards", [[], [], [], []])[seat] or []:
+        t = d.get("tile") if isinstance(d, dict) else d
+        if isinstance(t, int):
+            out.append(_kind(t))
+    return out
+
+
+def _visible_counts(state, seat):
+    vis = [0] * 34
+    for t in (state.get("hands", [None] * 4)[seat] or []):
+        if isinstance(t, int) and 0 <= t <= 36:
+            vis[_kind(t)] += 1
+    for s2 in range(4):
+        for k in _discard_kinds(state, s2):
+            vis[k] += 1
+        for m in (state.get("melds", [[], [], [], []])[s2] or []):
+            for t in (m.get("tiles") or []):
+                if isinstance(t, int) and 0 <= t <= 36:
+                    vis[_kind(t)] += 1
+    for t in (state.get("dora_indicators") or []):
+        if isinstance(t, int) and 0 <= t <= 36:
+            vis[_kind(t)] += 1
+    return vis
+
+
+def _dora_kinds(state):
+    kinds = set()
+    for t in (state.get("dora_indicators") or []):
+        if not isinstance(t, int) or not (0 <= t <= 36):
+            continue
+        k = _kind(t)
+        if k >= 31:
+            kinds.add(31 + (k - 31 + 1) % 3)
+        elif k >= 27:
+            kinds.add(27 + (k - 27 + 1) % 4)
+        else:
+            kinds.add((k // 9) * 9 + (k % 9 + 1) % 9)
+    return kinds
+
+
+def _yakuhai_kinds(state, seat):
+    dealer = state.get("dealer") or 0
+    seat_wind = 27 + (seat - dealer) % 4
+    rnd = state.get("round") or {}
+    rw = rnd.get("wind")
+    if not isinstance(rw, int):
+        label = rnd.get("label") or ""
+        rw = 1 if label.startswith("南") else 0
+    return {31, 32, 33, seat_wind, 27 + rw}
+
+
+def _suit_options(counts9, honor):
+    results = set()
+
+    def rec(a, m, t, p):
+        i = -1
+        for j, v in enumerate(a):
+            if v > 0:
+                i = j
+                break
+        if i < 0:
+            results.add((m, t, p))
+            return
+        a = list(a)
+        if a[i] >= 3:
+            a[i] -= 3
+            rec(tuple(a), m + 1, t, p)
+            a[i] += 3
+        if not honor and i <= 6 and a[i + 1] > 0 and a[i + 2] > 0:
+            a[i] -= 1; a[i + 1] -= 1; a[i + 2] -= 1
+            rec(tuple(a), m + 1, t, p)
+            a[i] += 1; a[i + 1] += 1; a[i + 2] += 1
+        if a[i] >= 2 and not p:
+            a[i] -= 2
+            rec(tuple(a), m, t, 1)
+            a[i] += 2
+        if a[i] >= 2:
+            a[i] -= 2
+            rec(tuple(a), m, t + 1, p)
+            a[i] += 2
+        if not honor and i <= 7 and a[i + 1] > 0:
+            a[i] -= 1; a[i + 1] -= 1
+            rec(tuple(a), m, t + 1, p)
+            a[i] += 1; a[i + 1] += 1
+        if not honor and i <= 6 and a[i + 2] > 0:
+            a[i] -= 1; a[i + 2] -= 1
+            rec(tuple(a), m, t + 1, p)
+            a[i] += 1; a[i + 2] += 1
+        a[i] -= 1
+        rec(tuple(a), m, t, p)
+        a[i] += 1
+
+    rec(tuple(counts9), 0, 0, 0)
+    return results
+
+
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=None)
+def _shanten_counts(counts_t):
+    counts = list(counts_t)
+    groups = []
+    for s in range(3):
+        groups.append(_suit_options(tuple(counts[s * 9:(s + 1) * 9]), False))
+    groups.append(_suit_options(tuple(counts[27:34]), True))
+    best = [8]
+
+    def combine(gi, m, t, p):
+        if gi == 4:
+            sh = 8 - (2 * m + t + p) + max(0, m + t - 4)
+            if sh < best[0]:
+                best[0] = sh
+            return
+        for (gm, gt, gp) in groups[gi]:
+            if p and gp:
+                continue
+            combine(gi + 1, m + gm, t + gt, p or gp)
+
+    combine(0, 0, 0, 0)
+    n = sum(counts)
+    if n >= 13:
+        pairs = sum(1 for v in counts if v >= 2)
+        kinds = sum(1 for v in counts if v > 0)
+        chi = 6 - pairs + max(0, 7 - kinds)
+        if chi < best[0]:
+            best[0] = chi
+    yao = (0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33)
+    uniq = sum(1 for k in yao if counts[k] > 0)
+    has_pair = any(counts[k] >= 2 for k in yao)
+    kok = 13 - uniq - (1 if has_pair else 0)
+    if kok < best[0]:
+        best[0] = kok
+    return best[0]
+
+
+def _shanten(hand_tiles):
+    return _shanten_counts(tuple(_counts34(hand_tiles)))
+
+
+def _ukeire(counts, visible):
+    cur = _shanten_counts(tuple(counts))
+    kinds = []
+    tiles = 0
+    for k in range(34):
+        if counts[k] >= 4:
+            continue
+        c2 = list(counts)
+        c2[k] += 1
+        if _shanten_counts(tuple(c2)) < cur:
+            kinds.append(k)
+            tiles += max(0, 4 - visible[k])
+    return kinds, tiles
+
+
+def _hand_value_hints(state, seat, hand_tiles):
+    """Rough value signals: dora count and yakuhai holdings."""
+    dk = _dora_kinds(state)
+    yk = _yakuhai_kinds(state, seat)
+    counts = _counts34(hand_tiles)
+    dora = 0
+    for t in hand_tiles:
+        if isinstance(t, int) and _kind(t) in dk:
+            dora += 1
+        if t in (34, 35, 36):
+            dora += 1
+    for m in (state.get("melds", [[], [], [], []])[seat] or []):
+        for t in (m.get("tiles") or []):
+            if isinstance(t, int) and _kind(t) in dk:
+                dora += 1
+    yaku_triplets = sum(1 for k in yk if counts[k] >= 3)
+    yaku_pairs = sum(1 for k in yk if counts[k] == 2)
+    return dora, yaku_triplets, yaku_pairs
+
+
+def _tile_danger(kind, riichi_kinds, visible):
+    """Relative deal-in risk of discarding `kind` into one riichi player."""
+    if kind in riichi_kinds:
+        return 0.0
+    if kind >= 27:
+        seen = visible[kind]
+        return 0.2 if seen >= 3 else 0.4 if seen == 2 else 0.6 if seen == 1 else 0.75
+    suit, rank = kind // 9, kind % 9
+    if rank in (0, 8):
+        base = 0.45
+    elif rank in (1, 7):
+        base = 0.6
+    elif rank in (2, 6):
+        base = 0.8
+    else:
+        base = 1.0
+    suji = any(d < 27 and d // 9 == suit and abs(d % 9 - rank) == 3
+               for d in riichi_kinds)
+    return base * (0.55 if suji else 1.0)
+
+
+def _strong_choose(state, seat, actions):
+    """The strong bot's policy: shanten/ukeire first, value-aware riichi,
+    and real defence against riichi. Plays only from the offered actions."""
+    types = [a.get("type") for a in actions]
+    hand = state.get("hands", [None] * 4)[seat] or []
+    counts = _counts34(hand)
+    visible = _visible_counts(state, seat)
+    riichi_flags = state.get("riichi") or [False] * 4
+    opp_riichi = [s2 for s2 in range(4) if s2 != seat and riichi_flags[s2]]
+    my_shanten = _shanten(hand) if hand else 8
+    dora_n, ytrip, ypair = _hand_value_hints(state, seat, hand)
+    melds_open = any((m.get("type") != "ankan")
+                     for m in (state.get("melds", [[], [], [], []])[seat] or []))
+
+    # --- reaction phase ---
+    if state.get("phase") == "reaction" or "pass" in types and hand and len(hand) % 3 == 1:
+        if "ron" in types:
+            return next(a for a in actions if a.get("type") == "ron")
+        defending = bool(opp_riichi) and my_shanten >= 2
+        if not defending:
+            called_kind = None
+            fs = state.get("from_seat")
+            if isinstance(fs, int) and 0 <= fs <= 3:
+                ds = state.get("discards", [[], [], [], []])[fs] or []
+                if ds:
+                    last = ds[-1]
+                    lt = last.get("tile") if isinstance(last, dict) else last
+                    if isinstance(lt, int):
+                        called_kind = _kind(lt)
+            yk = _yakuhai_kinds(state, seat)
+            for a in actions:
+                if a.get("type") not in ("pon", "chi"):
+                    continue
+                consume = a.get("consume") or []
+                ck = [_kind(t) for t in consume if isinstance(t, int)]
+                if len(ck) != (2 if a.get("type") == "pon" else 2):
+                    continue
+                after = list(counts)
+                for k in ck:
+                    after[k] -= 1
+                if called_kind is not None:
+                    after[called_kind] += 1
+                # best discard after the call (approximate: drop the worst tile)
+                base = _shanten_counts(tuple(after))
+                improves = base < my_shanten
+                forms_yakuhai = (a.get("type") == "pon" and called_kind in yk
+                                 and counts[called_kind] >= 2)
+                if forms_yakuhai or (improves and (dora_n >= 2 or melds_open)):
+                    return a
+        if "pass" in types:
+            return next(a for a in actions if a.get("type") == "pass")
+        return actions[0] if actions else None
+
+    # --- draw phase ---
+    if "tsumo" in types:
+        return next(a for a in actions if a.get("type") == "tsumo")
+    discards = [a for a in actions if a.get("type") == "discard"]
+    if not discards:
+        for a in actions:
+            if a.get("type") == "kyushu_kyuhai" and my_shanten >= 4:
+                return a
+        return actions[0] if actions else None
+    if riichi_flags[seat]:
+        drawn = state.get("last_drawn")
+        for a in discards:
+            if a.get("tile") == drawn:
+                return a
+        return discards[0]
+
+    dk = _dora_kinds(state)
+    yk = _yakuhai_kinds(state, seat)
+    suit_counts = [sum(counts[s * 9:(s + 1) * 9]) for s in range(3)]
+    dominant = max(suit_counts) if suit_counts else 0
+
+    defending = False
+    fold_cheap = (dora_n + ytrip * 2 + ypair) <= 1
+    if opp_riichi and (my_shanten >= 2 or (my_shanten == 1 and fold_cheap)):
+        defending = True
+
+    def evaluate(a):
+        t = a.get("tile")
+        k = _kind(t) if isinstance(t, int) else -1
+        after = list(counts)
+        if 0 <= k <= 33:
+            after[k] -= 1
+        sh = _shanten_counts(tuple(after))
+        _uk, uk_tiles = _ukeire(after, visible)
+        penalty = 0.0
+        if k in dk:
+            penalty += 0.6
+        if t in (34, 35, 36):
+            penalty += 0.6
+        if k in yk:
+            if counts[k] == 2:
+                penalty += 0.45
+            elif counts[k] >= 3:
+                penalty += 0.9
+        if dominant >= 8 and 0 <= k <= 26 and suit_counts[k // 9] < dominant and counts[k] <= 2:
+            penalty -= 0.25
+        danger = 0.0
+        if defending:
+            danger = max((_tile_danger(k, set(_discard_kinds(state, s2)), visible)
+                          for s2 in opp_riichi), default=0.0)
+        return (danger if defending else 0.0, sh, -uk_tiles, penalty, k)
+
+    if defending:
+        return min(discards, key=evaluate)
+
+    riichi_opts = [a for a in discards if a.get("riichi_discard") is True]
+    if riichi_opts and not melds_open:
+        best_r = min(riichi_opts, key=evaluate)
+        t = best_r.get("tile")
+        k = _kind(t) if isinstance(t, int) else -1
+        after = list(counts)
+        if 0 <= k <= 33:
+            after[k] -= 1
+        if _shanten_counts(tuple(after)) == 0:
+            _uk, uk_tiles = _ukeire(after, visible)
+            dama_value = dora_n + ytrip * 2 >= 5
+            if uk_tiles >= 4 and not dama_value:
+                return best_r
+    return min(discards, key=evaluate)
+
+
+
+def cmd_bot(args: argparse.Namespace, files: SecureFiles) -> int:
+    """Play this bot seat with the fixed simple policy until the match ends.
+
+    Run it under its own --home (e.g. JANSOU_HOME=~/.jansou-bot) after a
+    `join --bot`. The bot never plays a human's seat: it requires the bot
+    marker recorded at join time.
+    """
+    import time as _time
+    config, api = load_context(files, args.timeout)
+    require_role(config, "player", "bot")
+    if not config.get("bot"):
+        raise HelperError("この資格は bot 席ではありません。専用の --home で join --bot してから実行してください。")
+    seat = config["seat"]
+    deadline = _time.time() + args.max_minutes * 60
+    print("bot開始: 席%d（%s）。試合終了まで自動で打ちます。" % (seat, config.get("display_name", "")))
+    acted = 0
+    errors = 0
+    while _time.time() < deadline:
+        try:
+            state = api.call("GET", "state")
+            errors = 0
+        except APIError as error:
+            if error.status == 401:
+                print("資格が失効しました（席を交代した可能性があります）。botを終了します。")
+                return 0
+            # 一時的な通信の乱れでは止まらない（締め切りはサーバーが守る）。
+            errors += 1
+            if errors >= 15:
+                print("通信エラーが続くためbotを終了します。")
+                return 1
+            _time.sleep(min(5.0, args.interval * errors))
+            continue
+        if state.get("match_status") == "finished" or state.get("phase") == "finished":
+            print("試合終了: %s" % (state.get("scores"),))
+            return 0
+        d = extract_decision(state, seat)
+        if d is None:
+            _time.sleep(args.interval)
+            continue
+        actions = actions_for(d)
+        choice = (_strong_choose(state, seat, actions) if getattr(args, "strong", False)
+                  else _bot_choose(state, seat, actions))
+        if choice is None:
+            _time.sleep(args.interval)
+            continue
+        identity = decision_identity(state, d)
+        try:
+            lease = api.call("POST", "claim", {"seat": seat, "decision_id": identity})
+        except APIError:
+            _time.sleep(args.interval)
+            continue
+        claim_token = lease.get("claim_token")
+        if not isinstance(claim_token, str) or not claim_token:
+            _time.sleep(args.interval)
+            continue
+        try:
+            current = api.call("GET", "state")
+        except APIError:
+            _time.sleep(args.interval)
+            continue
+        d2 = extract_decision(current, seat)
+        if d2 is None or decision_identity(current, d2) != identity or not any(
+                action_signature(a) == action_signature(choice) for a in actions_for(d2)):
+            continue
+        body = {
+            "seat": seat,
+            "decision_id": identity,
+            "expected_revision": current.get("revision"),
+            "idempotency_key": "jh-bot-" + uuid.uuid4().hex,
+            "action": choice.get("type"),
+        }
+        for key in ACTION_FIELDS:
+            if key in choice:
+                body[key] = choice[key]
+        if choice.get("riichi_discard") is True and choice.get("type") == "discard":
+            body["riichi"] = True
+        actor = {"name": config.get("display_name", "")}
+        if config.get("icon"):
+            actor["icon"] = config["icon"]
+        body["actor"] = actor
+        body["claim_token"] = claim_token
+        try:
+            result = api.call("POST", "actions", body)
+            if result.get("ok") is True:
+                acted += 1
+        except APIError:
+            pass
+        _time.sleep(0.3)
+    print("bot終了（制限時間）。打った手数: %d" % acted)
+    return 0
+
+
 def cmd_leave(args: argparse.Namespace, files: SecureFiles) -> int:
     """Leave this Player seat; the former credential is then locally removed."""
     with files.lock():
@@ -1618,12 +2152,14 @@ def parser() -> argparse.ArgumentParser:
     j.add_argument("--invite", help="招待コード。'-'なら非表示入力（推奨）")
     j.add_argument("--name", required=True, help="表示名")
     j.add_argument("--icon", help="アイコン用絵文字")
+    j.add_argument("--avatar-url", help="アバター画像のURL（https、GIF/WebP等の動画も可）")
     j.add_argument("--role", choices=("player", "spectator"), default="player",
                    help="招待の役割（既定: player）。実際の役割は招待コード側で確定")
     j.add_argument("--support", type=int, help="spectatorの応援席0～3（指定なしは招待の固定席または外野）")
     j.add_argument("--base", default=DEFAULT_BASE, help="サーバーURL")
     j.add_argument("--room", default=DEFAULT_ROOM, help="卓ID")
     j.add_argument("--replace", action="store_true", help="登録済みの資格ファイルを上書き")
+    j.add_argument("--bot", action="store_true", help="bot席として参加（リレーで先に譲る。専用の--home推奨）")
 
     rank_parser = subs.add_parser("ranking", help="卓の通算勝ち点ランキングと直近5半荘を表示")
     rank_parser.add_argument("--json", action="store_true", help="ランキングと直近結果を機械可読JSONで表示")
@@ -1672,8 +2208,15 @@ def parser() -> argparse.ArgumentParser:
     flag.add_argument("seq", type=int, help="cheersのコメントseq")
 
     subs.add_parser("leave", help="現在のPlayer資格を失効させ席を退室")
+    subs.add_parser("rematch", help="試合終了後に次の試合を開始（待ち列がいれば交代）")
+    bt = subs.add_parser("bot", help="bot席を単純な打ち筋で自動運転（join --botした専用資格で）")
+    bt.add_argument("--interval", type=float, default=1.5, help="局面確認の間隔秒（既定1.5）")
+    bt.add_argument("--max-minutes", type=float, default=60, help="自動運転の上限分（既定60）")
+    bt.add_argument("--strong", action="store_true", help="強い打ち筋（シャンテン・受け入れ・守備あり）で打つ")
     proxy = subs.add_parser("proxy", help="プロンプト代打ちの予約を宣言/取消（自分の席のみ）")
     proxy.add_argument("state", choices=["on", "off"], help="on=予約開始、off=予約取消")
+    av = subs.add_parser("avatar", help="自分のアバター画像URLを登録/変更（空文字で解除）")
+    av.add_argument("url", help="https URL（GIF/WebP等の動画も可）。''で解除")
     q = subs.add_parser("queue", help="待ち列へ参加（資格はローカル保存）")
     q.add_argument("--name", help="表示名（省略時は以前の設定）")
     q.add_argument("--icon", help="アイコン用絵文字")
@@ -1710,6 +2253,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "cheer-flag": cmd_cheer_flag,
             "leave": cmd_leave,
             "proxy": cmd_proxy,
+            "avatar": cmd_avatar,
+            "rematch": cmd_rematch,
+            "bot": cmd_bot,
             "queue": cmd_queue,
             "queue-status": cmd_queue_status,
             "queue-leave": cmd_queue_leave,

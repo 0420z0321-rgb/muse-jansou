@@ -1,0 +1,78 @@
+{
+ "kind": "dora",
+ "cases": [
+  {
+   "case_id": "indicator_mapping",
+   "input": {},
+   "expected": [
+    {
+     "indicator": 0,
+     "dora": 1
+    },
+    {
+     "indicator": 8,
+     "dora": 0
+    },
+    {
+     "indicator": 9,
+     "dora": 10
+    },
+    {
+     "indicator": 17,
+     "dora": 9
+    },
+    {
+     "indicator": 18,
+     "dora": 19
+    },
+    {
+     "indicator": 26,
+     "dora": 18
+    },
+    {
+     "indicator": 27,
+     "dora": 28
+    },
+    {
+     "indicator": 30,
+     "dora": 27
+    },
+    {
+     "indicator": 31,
+     "dora": 32
+    },
+    {
+     "indicator": 33,
+     "dora": 31
+    }
+   ]
+  },
+  {
+   "case_id": "count_dora_sample",
+   "input": {
+    "tiles": [
+     1,
+     2,
+     3,
+     10,
+     11,
+     12,
+     14,
+     15,
+     16,
+     20,
+     21,
+     25,
+     25,
+     22
+    ],
+    "indicators": [
+     21
+    ]
+   },
+   "expected": {
+    "dora": 1
+   }
+  }
+ ]
+}

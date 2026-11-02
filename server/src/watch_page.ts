@@ -35,6 +35,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
   #gate select { font-size:14px; padding:8px; width:76%; border-radius:6px; border:none; margin-bottom:8px; }
   #gate .note { font-size:12px; opacity:.85; }
   .htiles.open .tile { outline:1px solid #c9a227; }
+  .tile.aka { background:#fbe9e7; box-shadow:inset 0 0 0 2px #c0392b; }
   .seatnote { font-size:11px; color:#e8b13c; }
   #gate button { font-size:16px; padding:8px 14px; border-radius:6px; border:none; background:#e8b13c; color:#222; cursor:pointer; }
   #gate .err { color:#ff9a9a; min-height:20px; font-size:13px; }
@@ -61,6 +62,23 @@ export const WATCH_HTML = `<!DOCTYPE html>
   .handstrip.v { flex-direction:column; width:51px; padding:8px 4px; margin:0; }
   .handstrip .chip { font-size:12px; font-weight:bold; white-space:nowrap; text-align:center; line-height:1.5; }
   .handstrip .chip .score { color:#ffd968; display:block; }
+  .avatar { display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border-radius:50%; background:#fdfdf6; border:2px solid #c8c8b8; font-size:16px; margin-right:5px; vertical-align:-8px; overflow:hidden; }
+  .handstrip.turn .avatar { border-color:#e8b13c; box-shadow:0 0 9px #e8b13c; }
+  .chip .pname { font-weight:normal; opacity:.92; margin-left:5px; }
+  #danmaku { position:fixed; left:0; right:0; top:0; height:44%; pointer-events:none; overflow:hidden; z-index:40; }
+  #animLayer { position:fixed; inset:0; pointer-events:none; overflow:hidden; z-index:41; }
+  .animtile { position:absolute; width:30px; height:40px; transition:transform .5s ease, opacity .5s ease; will-change:transform,opacity; }
+  .fxglow { animation:fxglowA .7s ease; }
+  @keyframes fxglowA { 0% { box-shadow:0 0 0 0 rgba(255,217,104,0); } 30% { box-shadow:0 0 18px 6px rgba(255,217,104,.85); } 100% { box-shadow:0 0 0 0 rgba(255,217,104,0); } }
+  .fxwin { animation:fxwinA .7s ease 2; }
+  @keyframes fxwinA { 0% { box-shadow:0 0 0 0 rgba(255,120,160,0); } 30% { box-shadow:0 0 22px 9px rgba(255,120,160,.9); } 100% { box-shadow:0 0 0 0 rgba(255,120,160,0); } }
+  .dm { position:absolute; left:100%; white-space:nowrap; font-weight:bold; font-size:21px; color:#fff; text-shadow:1px 1px 2px #000, -1px 0 2px #000, 0 0 6px rgba(0,0,0,.6); }
+  .dm .dm-name { font-size:13px; opacity:.85; margin-right:7px; }
+  .fxbar { text-align:center; margin:2px 0 4px; }
+  .fxbar button { margin:0 3px; padding:5px 12px; border-radius:6px; border:1px solid #418262; background:#23543f; color:#f2f2e9; cursor:pointer; font-size:13px; }
+  .fxbar button.sel { background:#e8b13c; color:#222; border-color:#e8b13c; font-weight:bold; }
+  .avatar img { width:100%; height:100%; object-fit:cover; border-radius:50%; display:block; }
+  .occ-avatar { width:22px; height:22px; border-radius:50%; object-fit:cover; vertical-align:-6px; margin-right:5px; }
   .htiles { display:flex; gap:2px; align-items:center; }
   .handstrip.v .htiles { flex-direction:column; gap:0; }
   .handstrip.top .tile { transform:rotate(180deg); }
@@ -129,6 +147,9 @@ export const WATCH_HTML = `<!DOCTYPE html>
 </div>
 <div id="table">
   <h1>🀄 Muse雀荘 観戦</h1>
+  <div id="danmaku"></div>
+  <div id="animLayer"></div>
+  <div class="fxbar"><button id="dmToggle">💬 コメントを流す</button> <button id="seButton">🔊 音ON</button></div>
   <div id="meta"></div>
   <div id="occupancy" aria-label="参加・観戦状況" aria-live="polite" style="display:none"></div>
   <div id="ranking" aria-label="ランキング" aria-live="polite" style="display:none"></div>
@@ -171,9 +192,10 @@ export const WATCH_HTML = `<!DOCTYPE html>
 <script>
 var roomId = location.pathname.split("/")[2];
 var NAMES = ["1m","2m","3m","4m","5m","6m","7m","8m","9m","1p","2p","3p","4p","5p","6p","7p","8p","9p","1s","2s","3s","4s","5s","6s","7s","8s","9s","東","南","西","北","白","發","中"];
+function kindOfCode(n) { return n === 34 ? 4 : n === 35 ? 13 : n === 36 ? 22 : n; }
 function tname(t) {
   if (t === null || t === undefined) return "?";
-  if (typeof t === "number") return NAMES[t] || ("#" + t);
+  if (typeof t === "number") return t >= 34 && t <= 36 ? "赤" + (NAMES[kindOfCode(t)] || "") : (NAMES[t] || ("#" + t));
   if (typeof t === "string") return t;
   if (typeof t === "object") {
     if (typeof t.name === "string") return t.name;
@@ -243,10 +265,11 @@ function faceSVG(n) {
 }
 function tileSpan(t, cls) {
   var n = (typeof t === "object" && t) ? t.tile : t;
-  if (typeof n !== "number" || n < 0 || n > 33) {
+  if (typeof n !== "number" || n < 0 || n > 36) {
     return '<span class="tile txt' + (cls ? " " + cls : "") + '">' + tname(t) + "</span>";
   }
-  return '<span class="tile' + (cls ? " " + cls : "") + '"><svg viewBox="0 0 30 40" aria-label="' + tname(t) + '">' + faceSVG(n) + "</svg></span>";
+  var aka = n >= 34 ? " aka" : "";
+  return '<span class="tile' + aka + (cls ? " " + cls : "") + '"><svg viewBox="0 0 30 40" aria-label="' + tname(t) + '">' + faceSVG(kindOfCode(n)) + "</svg></span>";
 }
 function windName(seat, dealer) {
   return ["東家","南家","西家","北家"][(seat - dealer + 4) % 4];
@@ -300,6 +323,11 @@ function renderOccupancy(st) {
     }
     cell.appendChild(label);
     cell.appendChild(value);
+    if (typeof item.avatar_url === "string" && item.avatar_url.indexOf("https://") === 0) {
+      var avImg = document.createElement("img");
+      avImg.className = "occ-avatar"; avImg.src = item.avatar_url; avImg.alt = "";
+      cell.insertBefore(avImg, value);
+    }
     row.appendChild(cell);
   }
   host.appendChild(row);
@@ -380,7 +408,12 @@ function render(st) {
     var isTurn = (st.turn === s && st.match_status !== "finished");
     var strip = document.getElementById("hand-" + pos);
     strip.className = "handstrip " + pos + ((pos === "left" || pos === "right") ? " v" : "") + (isTurn ? " turn" : "");
-    var chip = '<div class="chip">' + windName(s, dealer) +
+    var occSeat = (st.occupancy && st.occupancy.seats && st.occupancy.seats[s]) || null;
+    var avUrl = (occSeat && occSeat.joined && typeof occSeat.avatar_url === "string" && occSeat.avatar_url.indexOf("https://") === 0) ? occSeat.avatar_url : null;
+    var avIcon = (occSeat && occSeat.joined && typeof occSeat.icon === "string" && occSeat.icon) ? occSeat.icon : windName(s, dealer);
+    var avInner = avUrl ? '<img src="' + esc(avUrl) + '" alt="">' : esc(avIcon);
+    var avName = (occSeat && occSeat.joined && typeof occSeat.display_name === "string" && occSeat.display_name) ? '<span class="pname">' + esc(occSeat.display_name) + "</span>" : "";
+    var chip = '<div class="chip"><span class="avatar">' + avInner + "</span>" + windName(s, dealer) + avName +
       (riichiOn(st, s) ? '<span class="riichi">リーチ</span>' : "") +
       '<span class="score">' + ((st.scores || [])[s] ?? "?") + "点</span></div>";
     var hand = (st.hands || [])[s];
@@ -481,6 +514,7 @@ function load() {
       document.getElementById("table").style.display = "block";
       render(st);
       afterRender(st);
+      maybeInitWatchFX();
     })
     .catch(function(e) { if (String(e.message) !== "unauthorized") console.log(e); });
 }
@@ -523,6 +557,66 @@ if (sessionStorage.getItem("watchPw") && !sessionStorage.getItem("watchSecret"))
 if (sessionStorage.getItem("watchSecret")) load();
 setInterval(function() {
   if (document.getElementById("table").style.display === "block") load();
+}, 5000);
+
+// ---- danmaku (flowing cheers, Niconico style) ----
+var dmSeeded = false, dmLanes = [], DM_LANES = 7, DM_COLORS = ["#ffd968", "#9adcff", "#ffb3c1", "#b6ffb6"];
+var dmTokCursor = 0, dmTokSeeded = false, dmTokDead = false;
+function dmEnabled() { return localStorage.getItem("watchDanmaku") !== "0"; }
+function dmRefreshToggle() {
+  var b = document.getElementById("dmToggle");
+  if (b) b.className = dmEnabled() ? "sel" : "";
+  var layer = document.getElementById("danmaku");
+  if (layer && !dmEnabled()) layer.innerHTML = "";
+}
+function dmSpawn(text, name, seat) {
+  if (!dmEnabled()) return;
+  var layer = document.getElementById("danmaku");
+  if (!layer || document.getElementById("table").style.display !== "block") return;
+  if (layer.childElementCount >= 14) return;
+  var now = Date.now(), lane = -1;
+  for (var i = 0; i < DM_LANES; i++) { if (!dmLanes[i] || dmLanes[i] < now) { lane = i; break; } }
+  if (lane < 0) return;
+  var el = document.createElement("div");
+  el.className = "dm";
+  el.style.top = (6 + lane * 38) + "px";
+  if (typeof seat === "number" && DM_COLORS[seat]) el.style.color = DM_COLORS[seat];
+  if (name) { var nm = document.createElement("span"); nm.className = "dm-name"; nm.textContent = name; el.appendChild(nm); }
+  el.appendChild(document.createTextNode(String(text)));
+  layer.appendChild(el);
+  var w = el.offsetWidth || 200, vw = window.innerWidth || 800;
+  var dur = Math.max(3800, (vw + w) / 150 * 1000);
+  dmLanes[lane] = now + Math.min(dur, (w + 90) / 150 * 1000);
+  var anim = el.animate([{ transform: "translateX(0)" }, { transform: "translateX(-" + (vw + w + 30) + "px)" }], { duration: dur, easing: "linear" });
+  anim.onfinish = function() { el.remove(); };
+}
+function dmFlowNew(list, seatHint) {
+  list.forEach(function(c, i) {
+    setTimeout(function() { dmSpawn(c.text, c.from || "", (typeof c.target_seat === "number" ? c.target_seat : seatHint)); }, i * 650);
+  });
+}
+function dmPollToken() {
+  if (dmTokDead) return;
+  if ((sessionStorage.getItem("watchMode") || "pw") !== "token") return;
+  var secret = sessionStorage.getItem("watchSecret") || "";
+  if (!secret) return;
+  fetch("/rooms/" + roomId + "/cheers?after=" + dmTokCursor, { headers: { "Authorization": "Bearer " + secret } })
+    .then(function(res) { if (!res.ok) { dmTokDead = true; return null; } return res.json(); })
+    .then(function(d) {
+      if (!d || !Array.isArray(d.comments) || !d.comments.length) return;
+      dmTokCursor = d.comments[d.comments.length - 1].seq;
+      if (!dmTokSeeded) { dmTokSeeded = true; dmFlowNew(d.comments.slice(-2), null); }
+      else dmFlowNew(d.comments, null);
+    })
+    .catch(function() {});
+}
+document.getElementById("dmToggle").addEventListener("click", function() {
+  localStorage.setItem("watchDanmaku", dmEnabled() ? "0" : "1");
+  dmRefreshToggle();
+});
+dmRefreshToggle();
+setInterval(function() {
+  if (document.getElementById("table").style.display === "block") dmPollToken();
 }, 5000);
 // ---- guest cheers (password mode only) ----
 var cheerCursor = 0, cheerItems = [], cheerSupportSeen = null;
@@ -571,9 +665,12 @@ function loadCheers() {
     .then(function(d) {
       if (!d || !Array.isArray(d.comments)) return;
       if (d.comments.length) {
+        var freshDm = d.comments;
         cheerItems = cheerItems.concat(d.comments);
         cheerCursor = d.comments[d.comments.length - 1].seq;
         renderCheers();
+        if (!dmSeeded) { dmSeeded = true; dmFlowNew(freshDm.slice(-2), guestSupport()); }
+        else dmFlowNew(freshDm, guestSupport());
       }
     })
     .catch(function() {});
@@ -592,7 +689,7 @@ function updateSupportRow(st) {
   for (var j = 0; j < btns.length; j++) {
     btns[j].addEventListener("click", function() {
       localStorage.setItem("watchSupport", this.getAttribute("data-seat"));
-      cheerCursor = 0; cheerItems = []; renderCheers();
+      cheerCursor = 0; cheerItems = []; dmSeeded = false; renderCheers();
       document.getElementById("cheerMsg").textContent = "";
       updateSupportRow(window.__lastState);
       loadCheers();
@@ -606,7 +703,7 @@ function afterRender(st) {
   if (mode !== "pw") { panel.style.display = "none"; return; }
   panel.style.display = "block";
   var sup = guestSupport();
-  if (sup !== cheerSupportSeen) { cheerSupportSeen = sup; cheerCursor = 0; cheerItems = []; renderCheers(); }
+  if (sup !== cheerSupportSeen) { cheerSupportSeen = sup; cheerCursor = 0; cheerItems = []; dmSeeded = false; renderCheers(); }
   else if (!cheerItems.length) { renderCheers(); }
   updateSupportRow(st);
   if (sup === null) {
@@ -642,6 +739,504 @@ document.getElementById("cheerSend").addEventListener("click", function() {
 document.getElementById("cheerText").addEventListener("keydown", function(e) {
   if (e.key === "Enter") document.getElementById("cheerSend").click();
 });
+
+// ---- watch SE (delivered module; event polling shared with FX) ----
+/* Muse雀荘 watch event stream + WebAudio SE v2, standalone browser snippet.
+ * window.JansouSE.init({roomId, getAuthHeaders, button, intervalMs?:1500})
+ * window.JansouEvents.subscribe(function (event) { ... }) -> unsubscribe()
+ * event = {seq, revision, signals:[{type,seat?,tile?,call_type?,win_type?,from_seat?}]}
+ * ONE polling loop shared by subscribers and audio; audio is ALWAYS OFF at load.
+ * The draw event means hand DRAW/ryuukyoku. tile_draw means a player's tsumo.
+ * Never persist, log, or embed authentication credentials.
+ */
+(function (global) {
+  "use strict";
+
+  var PREFERENCE_KEY = "muse-jansou-watch-se-preference-v1";
+  var active = null;
+
+  function readPreference() {
+    try { return global.localStorage.getItem(PREFERENCE_KEY) === "1"; }
+    catch (_) { return false; }
+  }
+  function savePreference(value) {
+    try { global.localStorage.setItem(PREFERENCE_KEY, value ? "1" : "0"); }
+    catch (_) { /* Storage may be disabled. Audio stays session-local. */ }
+  }
+  function validCursor(value) {
+    return Number.isSafeInteger(value) && value >= 0 && value <= 999999999999999;
+  }
+  function validSeat(value) {
+    return Number.isSafeInteger(value) && value >= 0 && value <= 3;
+  }
+  function sanitizeTile(value) {
+    if (Number.isSafeInteger(value) && value >= 0 && value <= 135) return value;
+    if (typeof value === "string" &&
+        /^(?:[0-9]{1,2}[mpsz]|[mpsz][0-9]{1,2}|[1-9](?:man|pin|sou)|[一二三四五六七八九][萬万筒索]|[1-9][萬万筒索]|[東南西北白發発中]|[ESWNPCF]|[🀀-🀫]|(?:aka|red)[0-9][mps])$/iu.test(value)) {
+      return value;
+    }
+    if (value && typeof value === "object" && !Array.isArray(value) &&
+        ["m", "p", "s", "z"].indexOf(value.suit) !== -1 &&
+        Number.isSafeInteger(value.rank) && value.rank >= 0 &&
+        value.rank <= (value.suit === "z" ? 7 : 9)) {
+      var copy = { suit: value.suit, rank: value.rank };
+      if (value.red === true) copy.red = true;
+      return copy;
+    }
+    return null;
+  }
+  function normalizeSignal(signal) {
+    if (!signal || typeof signal !== "object" || Array.isArray(signal)) return null;
+    var seat = signal.seat;
+    switch (signal.type) {
+      case "tile_draw":
+      case "riichi":
+      case "score_change":
+        return validSeat(seat) ? { type: signal.type, seat: seat } : null;
+      case "discard":
+        return validSeat(seat) ? { type: "discard", seat: seat,
+          tile: sanitizeTile(signal.tile) } : null;
+      case "call":
+        return validSeat(seat) ? { type: "call", seat: seat,
+          call_type: ["chi", "pon", "kan"].indexOf(signal.call_type) !== -1
+            ? signal.call_type : null } : null;
+      case "win":
+        if (!validSeat(seat)) return null;
+        var output = { type: "win", seat: seat,
+          win_type: ["tsumo", "ron"].indexOf(signal.win_type) !== -1
+            ? signal.win_type : null };
+        if (output.win_type === "ron" && validSeat(signal.from_seat) && signal.from_seat !== seat) {
+          output.from_seat = signal.from_seat;
+        }
+        return output;
+      case "draw":        // Exhaustive/abortive hand draw, never a tile draw.
+      case "hand_start":
+      case "hand_end":
+        return { type: signal.type };
+      default:
+        return null;
+    }
+  }
+  function normalizeEvent(event, oldCursor, latest) {
+    if (!event || !validCursor(event.seq) || event.seq <= oldCursor ||
+        event.seq > latest || !Array.isArray(event.signals)) return null;
+    var signals = [];
+    for (var j = 0; j < Math.min(event.signals.length, 32); j++) {
+      var signal = normalizeSignal(event.signals[j]);
+      if (signal !== null) signals.push(signal);
+    }
+    // Deliver read-only records: one subscriber cannot accidentally change
+    // the next subscriber's events or the SE synth's event types.
+    for (var k = 0; k < signals.length; k++) {
+      if (signals[k].tile && typeof signals[k].tile === "object") {
+        Object.freeze(signals[k].tile);
+      }
+      Object.freeze(signals[k]);
+    }
+    Object.freeze(signals);
+    return Object.freeze({ seq: event.seq,
+      revision: Number.isSafeInteger(event.revision) ? event.revision : null,
+      signals: signals });
+  }
+
+  function initJansouSE(options) {
+    if (active !== null) throw new Error("JansouSE: already initialized; destroy first");
+    if (!options || typeof options.roomId !== "string" ||
+        !/^[a-zA-Z0-9_-]{1,128}$/.test(options.roomId) ||
+        typeof options.getAuthHeaders !== "function" || !options.button) {
+      throw new Error("JansouSE: roomId, getAuthHeaders, button are required");
+    }
+    var button = options.button;
+    var AudioCtor = global.AudioContext || global.webkitAudioContext;
+    var intervalMs = Math.max(1000, Number(options.intervalMs) || 1500);
+    var endpoint = "/rooms/" + encodeURIComponent(options.roomId) + "/watch-events";
+    var listeners = new Set();
+    var preferredOn = readPreference();
+    var audioOn = false;                // Even if preference was previously ON.
+    var destroyed = false;
+    var timer = null;
+    var request = null;
+    var busy = false;
+    var cursor = null;                 // Initial tail poll silently seeks now.
+    var generation = 0;
+    var consecutiveErrors = 0;
+    var catchingUp = false;
+    var catchUpPages = 0;
+    var authBlocked = false;
+    var unlocking = false;
+    var audio = null;
+    var master = null;
+    var noiseBuffer = null;
+
+    function wanted() {
+      return !destroyed && !authBlocked && (audioOn || listeners.size > 0);
+    }
+    function paint() {
+      button.textContent = audioOn ? "音OFF" : "音ON";
+      button.setAttribute("aria-pressed", audioOn ? "true" : "false");
+      button.title = audioOn ? "効果音を止める（イベント表示は継続）" :
+        (preferredOn ? "前回ON：クリックで音声を再開" : "クリックして効果音をON");
+    }
+    function muteOutput(muted) {
+      if (!audio || !master) return;
+      master.gain.cancelScheduledValues(audio.currentTime);
+      master.gain.setValueAtTime(muted ? 0 : 0.12, audio.currentTime);
+    }
+    function stopPolling() {
+      if (timer !== null) global.clearTimeout(timer);
+      timer = null;
+      if (request !== null) request.abort();
+      request = null;
+    }
+    function schedule(delay) {
+      if (timer !== null) global.clearTimeout(timer);
+      timer = null;
+      if (!wanted() || document.hidden) return;
+      timer = global.setTimeout(poll, delay);
+    }
+    function resetBaseline() {
+      generation++;
+      cursor = null;
+      catchingUp = false;
+      catchUpPages = 0;
+      consecutiveErrors = 0;
+      stopPolling();
+      if (wanted()) schedule(0);
+    }
+    function initAudio() {
+      if (audio) return;
+      if (!AudioCtor) throw new Error("WebAudio unavailable");
+      audio = new AudioCtor();
+      master = audio.createGain();
+      master.gain.value = 0;
+      master.connect(audio.destination);
+      var count = Math.max(1, Math.floor(audio.sampleRate * 0.045));
+      noiseBuffer = audio.createBuffer(1, count, audio.sampleRate);
+      var samples = noiseBuffer.getChannelData(0);
+      for (var i = 0; i < count; i++) {
+        var fade = 1 - i / count;
+        samples[i] = (Math.random() * 2 - 1) * fade * fade;
+      }
+    }
+    function note(freq, when, seconds, level, shape) {
+      var oscillator = audio.createOscillator();
+      var envelope = audio.createGain();
+      oscillator.type = shape || "sine";
+      oscillator.frequency.setValueAtTime(freq, when);
+      envelope.gain.setValueAtTime(0.0001, when);
+      envelope.gain.exponentialRampToValueAtTime(level, when + 0.008);
+      envelope.gain.exponentialRampToValueAtTime(0.0001, when + seconds);
+      oscillator.connect(envelope);
+      envelope.connect(master);
+      oscillator.start(when);
+      oscillator.stop(when + seconds + 0.02);
+    }
+    function clickSound(when, softer) {
+      var noise = audio.createBufferSource();
+      noise.buffer = noiseBuffer;
+      var filter = audio.createBiquadFilter();
+      filter.type = "highpass";
+      filter.frequency.value = softer ? 700 : 1100;
+      var envelope = audio.createGain();
+      envelope.gain.setValueAtTime(softer ? 0.16 : 0.28, when);
+      envelope.gain.exponentialRampToValueAtTime(0.0001, when + 0.042);
+      noise.connect(filter);
+      filter.connect(envelope);
+      envelope.connect(master);
+      noise.start(when);
+      noise.stop(when + 0.045);
+      note(softer ? 330 : 420, when, 0.06, 0.09, "triangle");
+    }
+    function play(type, when) {
+      if (!audioOn || !audio || audio.state !== "running") return;
+      switch (type) {
+        case "discard": clickSound(when, false); break;
+        case "call": clickSound(when, true); break;
+        case "riichi":
+          note(659.25, when, 0.13, 0.17, "sine");
+          note(987.77, when + 0.12, 0.22, 0.13, "sine");
+          break;
+        case "win":
+          note(523.25, when, 0.16, 0.13);
+          note(659.25, when + 0.12, 0.16, 0.13);
+          note(783.99, when + 0.24, 0.16, 0.13);
+          note(1046.50, when + 0.36, 0.31, 0.12);
+          break;
+        case "draw":
+          note(523.25, when, 0.16, 0.10);
+          note(392.00, when + 0.13, 0.24, 0.09);
+          break;
+        case "hand_start": note(783.99, when, 0.14, 0.12, "triangle"); break;
+        // tile_draw, hand_end and score_change are intentionally silent.
+      }
+    }
+    function emitLive(records) {
+      // Both SE and animation use the exact same validated live page.
+      // Subscribers are isolated; one failure must not stall this cursor.
+      for (var i = 0; i < records.length; i++) {
+        var record = records[i];
+        listeners.forEach(function (fn) {
+          try { fn(record); }
+          catch (_) { /* Do not log event bodies or credentials. */ }
+        });
+      }
+      if (!audioOn || document.hidden || !audio || audio.state !== "running") return;
+      var sounds = [];
+      for (var k = 0; k < records.length; k++) {
+        for (var j = 0; j < records[k].signals.length; j++) {
+          var type = records[k].signals[j].type;
+          if (["discard", "call", "riichi", "win", "draw", "hand_start"].indexOf(type) !== -1) {
+            sounds.push(type);
+          }
+        }
+      }
+      sounds = sounds.slice(-8);  // Avoid an audio pile-up.
+      var when = audio.currentTime + 0.025;
+      for (var n = 0; n < sounds.length; n++) play(sounds[n], when + n * 0.16);
+    }
+    async function poll() {
+      timer = null;
+      if (!wanted() || document.hidden || busy) return;
+      busy = true;
+      var epoch = generation;
+      var oldCursor = cursor;
+      var isTail = cursor === null;
+      var controller = new AbortController();
+      request = controller;
+      try {
+        var headers = new Headers(options.getAuthHeaders());
+        var response = await global.fetch(endpoint +
+          (isTail ? "?tail=1" : "?after=" + cursor), {
+          method: "GET", headers: headers, cache: "no-store",
+          credentials: "omit", signal: controller.signal
+        });
+        if (controller.signal.aborted || epoch !== generation) return;
+        if (response.status === 401 || response.status === 403) {
+          authBlocked = true; // Resume only after refresh() on successful login.
+          stopPolling();
+          return;
+        }
+        if (response.status === 409) {
+          var expired = await response.json();
+          if (expired && expired.error === "EVENT_CURSOR_EXPIRED" &&
+              validCursor(expired.latest_seq)) {
+            cursor = expired.latest_seq;
+            catchingUp = false;
+            catchUpPages = 0;
+            consecutiveErrors = 0;
+            return; // Old history is intentionally NOT animated or played.
+          }
+          throw new Error("watch-events invalid cursor conflict");
+        }
+        if (!response.ok) throw new Error("watch-events HTTP " + response.status);
+        var data = await response.json();
+        if (!data || !validCursor(data.latest_seq) || !Array.isArray(data.events)) {
+          throw new Error("watch-events invalid response");
+        }
+        if (controller.signal.aborted || epoch !== generation ||
+            !wanted() || document.hidden) return;
+        if (!isTail && data.latest_seq < oldCursor) {
+          resetBaseline(); // Server reset; do not play old records.
+          return;
+        }
+        var normalized = [];
+        if (!isTail) {
+          for (var i = 0; i < data.events.length; i++) {
+            var record = normalizeEvent(data.events[i], oldCursor, data.latest_seq);
+            if (record !== null) normalized.push(record);
+          }
+        }
+        cursor = data.latest_seq;
+        if (data.has_more) {
+          catchingUp = true;
+          catchUpPages++;
+          if (catchUpPages >= 5) {
+            resetBaseline(); // Bound pagination under a heavily active room.
+          } else {
+            schedule(150);
+          }
+        } else {
+          if (!isTail && !catchingUp && normalized.length <= 12) emitLive(normalized);
+          catchingUp = false;
+          catchUpPages = 0;
+        }
+        consecutiveErrors = 0;
+      } catch (_) {
+        if (!controller.signal.aborted && epoch === generation && wanted()) {
+          consecutiveErrors++;
+          schedule(Math.min(30000, intervalMs * Math.pow(2, Math.min(consecutiveErrors, 5))));
+        }
+      } finally {
+        if (request === controller) request = null;
+        busy = false;
+        if (epoch === generation && wanted() && !document.hidden && timer === null) {
+          schedule(intervalMs);
+        }
+      }
+    }
+    async function toggleAudio() {
+      if (destroyed || unlocking) return;
+      if (audioOn) {
+        audioOn = false;
+        muteOutput(true);
+        preferredOn = false;
+        savePreference(false);
+        paint();
+        // Animation subscribers continue to receive events, without new GETs.
+        if (!wanted()) resetBaseline();
+        return;
+      }
+      unlocking = true;
+      try {
+        initAudio();
+        await audio.resume(); // Triggered inside a real button-click handler.
+        if (destroyed || audio.state !== "running") return;
+        audioOn = true;
+        muteOutput(false);
+        preferredOn = true;
+        savePreference(true);
+        paint();
+        if (cursor === null && !authBlocked) schedule(0);
+      } catch (_) {
+        audioOn = false;
+        paint();
+      } finally {
+        unlocking = false;
+      }
+    }
+    function subscribe(fn) {
+      if (destroyed || typeof fn !== "function") throw new Error("JansouEvents: callback required");
+      var before = wanted();
+      listeners.add(fn);
+      if (!before && wanted()) resetBaseline();
+      var subscribed = true;
+      return function unsubscribe() {
+        if (!subscribed) return;
+        subscribed = false;
+        listeners.delete(fn);
+        if (!wanted()) resetBaseline();
+      };
+    }
+    function visibilityChanged() {
+      if (document.hidden) {
+        muteOutput(true);
+        generation++;
+        cursor = null;
+        catchingUp = false;
+        stopPolling();
+      } else {
+        muteOutput(!audioOn);
+        resetBaseline(); // Do not animate events missed in the background.
+      }
+    }
+    function refresh() {
+      authBlocked = false; // Call after changing room password/token.
+      resetBaseline();
+    }
+    function destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      generation++;
+      audioOn = false;
+      muteOutput(true);
+      stopPolling();
+      listeners.clear();
+      button.removeEventListener("click", toggleAudio);
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      global.removeEventListener("pagehide", destroy);
+      if (audio) { audio.close().catch(function () {}); audio = null; }
+      if (active === api) active = null;
+    }
+
+    var api = { refresh: refresh, destroy: destroy, subscribe: subscribe,
+      isOn: function () { return audioOn; } };
+    active = api;
+    button.disabled = !AudioCtor;
+    button.addEventListener("click", toggleAudio);
+    document.addEventListener("visibilitychange", visibilityChanged);
+    global.addEventListener("pagehide", destroy);
+    paint();
+    return api;
+  }
+
+  global.JansouSE = { init: initJansouSE };
+  global.JansouEvents = {
+    subscribe: function (callback) {
+      if (active === null) throw new Error("JansouEvents: initialize JansouSE first");
+      return active.subscribe(callback);
+    }
+  };
+})(window);
+
+// ---- watch FX: tile motion driven by the same events ----
+var fxInited = false;
+function fxSeatPos(seat) {
+  var dealer = (window.__lastState && typeof window.__lastState.dealer === "number") ? window.__lastState.dealer : 0;
+  return ["bottom", "right", "top", "left"][(seat - dealer + 4) % 4];
+}
+function fxCenter(el) {
+  if (!el) return null;
+  var r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+function fxFly(fromEl, toEl, html, rotate) {
+  var layer = document.getElementById("animLayer");
+  var a = fxCenter(fromEl), b = fxCenter(toEl);
+  if (!layer || !a || !b) return;
+  var d = document.createElement("div");
+  d.className = "animtile";
+  d.innerHTML = html;
+  d.style.left = (a.x - 15) + "px";
+  d.style.top = (a.y - 20) + "px";
+  layer.appendChild(d);
+  requestAnimationFrame(function() {
+    requestAnimationFrame(function() {
+      d.style.transform = "translate(" + (b.x - a.x) + "px," + (b.y - a.y) + "px)" + (rotate ? " rotate(90deg)" : "");
+      d.style.opacity = "0.15";
+    });
+  });
+  setTimeout(function() { if (d.parentNode) d.parentNode.removeChild(d); }, 560);
+}
+function fxFlash(el, cls) {
+  if (!el) return;
+  el.classList.add(cls);
+  setTimeout(function() { el.classList.remove(cls); }, 1500);
+}
+function fxOnEvent(ev) {
+  if (!ev) return;
+  if (ev.type === "hand_start") { fxFlash(document.getElementById("corecell"), "fxglow"); return; }
+  if (typeof ev.seat !== "number") return;
+  var pos = fxSeatPos(ev.seat);
+  var hand = document.getElementById("hand-" + pos);
+  var pond = document.getElementById("pond-" + pos);
+  if (ev.type === "tile_draw") {
+    fxFly(document.getElementById("corecell"), hand, '<span class="tile back"></span>', false);
+  } else if (ev.type === "discard") {
+    fxFly(hand, pond, tileSpan(ev.tile), !!ev.riichi);
+  } else if (ev.type === "riichi" || ev.type === "call") {
+    fxFlash(hand, "fxglow");
+  } else if (ev.type === "win") {
+    fxFlash(hand, "fxwin");
+  }
+}
+function maybeInitWatchFX() {
+  if (fxInited || !window.JansouSE) return;
+  var secret = sessionStorage.getItem("watchSecret") || "";
+  if (!secret) return;
+  fxInited = true;
+  try {
+    window.JansouSE.init({
+      roomId: roomId,
+      button: document.getElementById("seButton"),
+      getAuthHeaders: function() {
+        var m = sessionStorage.getItem("watchMode") || "pw";
+        var s = sessionStorage.getItem("watchSecret") || "";
+        return m === "token" ? { "Authorization": "Bearer " + s } : { "X-Watch-Password": s };
+      }
+    });
+    window.JansouEvents.subscribe(fxOnEvent);
+  } catch (e) { console.log(e); }
+}
 </script>
 </body>
 </html>

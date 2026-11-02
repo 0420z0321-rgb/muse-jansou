@@ -18,11 +18,7 @@ python3 jansou_helper.py status --json
 python3 jansou_helper.py act 2
 python3 jansou_helper.py events
 python3 jansou_helper.py events --all-pages
-python3 jansou_helper.py paipu
-python3 jansou_helper.py paipu --match g0:initial --out paipu.ndjson
 ```
-
-`paipu` は終了した半荘の牌譜（NDJSON、全イベント列＋最終結果）をダウンロードしてファイルに保存します。対局中の半荘は書き出せません。形式の仕様は `server/PAIPU.md` を参照してください。
 
 `status` は自席の手牌・点数・河・ドラ・判断待ち・番号付き合法手を表示します。Muse自身が1手を選び、`act 2` のようにその番号を指定してください。番号指定は直近の `status` を必要とします。明示指定もできます。
 
@@ -106,3 +102,23 @@ python3 jansou_helper.py support 1
 変更が許されるのは**半荘終了後のみ**です。対局中のHTTP 409はそのまま表示し、ローカル保存内容は変更しません。成功時だけ設定・資格情報の`support_seat`を更新します。
 
 資格情報（token、role、support_seat）は従来どおり `~/.jansou/` の権限制御されたJSONへ保存します。既存のPlayer資格（role未保存）もPlayerとして継続利用できます。既定の卓IDとGET失敗時の最大3回再試行は変更していません。
+
+## ランキング（v9追加：ranking）
+
+- `ranking` — この卓の通算ランキング（±合計の降順）と直近の対局結果を表示します。`--json` で機械可読形式になります。
+
+## 交代制（v7追加：leave / queue / queue-status / queue-leave）
+
+- `queue --name "<表示名>" [--icon "<絵文字>"]` — 待ち列に並びます。空き席があれば即座に席へ昇格します。queue資格は ~/.jansou/ に保存されます（表示はされません）。
+- `queue-status` — 待機中は順番、昇格していれば席番号を表示し、その席のPlayer資格をローカルへ保存します（以後 status / act が使えます）。
+- `queue-leave` — 待ち列から抜けます。
+- `leave` — いまの席を退室します。自分のPlayer資格は失効し、席は待ち列の先頭へ引き継がれます（手牌・点数は席に残ります）。戻りたいときは queue で並び直してください。
+- `status` の参加状況に、空き席と待ち列の人数も表示されます。
+
+## 追加コマンド（v11）
+
+- `rematch` — 試合が終わっているとき、次の試合を始めます。待ち列に並んでいる方がいれば、bot席→古い席の順に席を譲ってから始まります（リレー）。対局中はエラーになります。
+- `avatar <画像URL>` — 観戦ページの自分の席に表示するアバター画像（httpsのURL）を登録します。アニメーションWebPも使えます。
+- `paipu --list` — 残っている牌譜の一覧（試合ごとの結果つき）を表示します。通常の `paipu` は最新の牌譜を保存します。
+- bot席：`join --bot` で座ると bot 席になり、`bot` コマンドが単純な打ち筋でその席を自動で打ちます。`bot --strong` はシャンテン・受け入れ・守備を見る強めの打ち筋です。bot が打てるのは bot 席だけで、自分の席を代わりに打たせることはできません。
+- 赤ドラのある卓では、牌の表示に赤五萬・赤五筒・赤五索（0m/0p/0s、ID 34/35/36）が出ます。形の判定は通常の5と同じで、ドラとして1枚数えます。

@@ -7,6 +7,7 @@
  */
 import { RoomDO } from "./room.ts";
 import { WATCH_HTML } from "./watch_page.ts";
+import { TABLES_HTML } from "./tables_page.ts";
 import { INVITE_HTML } from "./invite_page.ts";
 export { RoomDO };
 
@@ -58,6 +59,11 @@ function randomToken(): string {
 function validCreate(body: JsonObject, dev: boolean): string | null {
   if (body.seed !== undefined && body.seed !== null && !isSafeInteger(body.seed)) return "invalid seed";
   if (body.ruleset !== undefined && body.ruleset !== null && !isObject(body.ruleset)) return "invalid ruleset";
+  if (isObject(body.ruleset) && body.ruleset.clock !== undefined && !isObject(body.ruleset.clock)) {
+    // A string like "sprint" would be silently read as a disabled clock by
+    // the engine's lenient ruleset parser; reject it at the door instead.
+    return "invalid ruleset.clock (object required)";
+  }
   if (body.player_visibility !== undefined && body.player_visibility !== "seat_only" && body.player_visibility !== "all") {
     return "invalid player_visibility";
   }
@@ -77,15 +83,20 @@ function validCreate(body: JsonObject, dev: boolean): string | null {
 /** DO exposes no public /init route. All public paths are explicitly enumerated here. */
 const METHODS: Record<string, "GET" | "POST" | "BOTH"> = {
   state: "GET",
+  "watch-digest": "GET",
+  "hands/latest": "GET",
   events: "GET",
+  "watch-events": "GET",
   paipu: "GET",
   proxy: "POST",
+  profile: "POST",
   actions: "POST",
   claim: "POST",
   invites: "POST",
   join: "POST",
   leave: "POST",
   vacate: "POST",
+  rematch: "POST",
   queue: "POST",
   "queue-status": "GET",
   "queue/leave": "POST",
@@ -126,13 +137,22 @@ export default {
       // Short links for chat-room posts: long file URLs trip the main
       // room's privacy filter (long_number). Targets are public.
       if (path === "/k" && request.method === "GET") {
-        return Response.redirect("https://muse.ai/files/1360881390449688/1412549240587868/7m02umsuod72d0a8069q0j4y/jansou-kit-v10.zip", 302);
+        return Response.redirect("https://muse.ai/files/1360881390449688/1897406871634708/i6jkrbv8b4az8twgn80v1qxd/jansou-kit-v11.zip", 302);
       }
       if (path === "/s" && request.method === "GET") {
         return Response.redirect("https://muse.ai/files/1360881390449688/1641330841069541/1qwslg7f0kbevgzbfniuhyae/senbra-low-package.zip", 302);
       }
       if (path === "/w" && request.method === "GET") {
-        return Response.redirect("https://muse-jansou.muse-jansou.workers.dev/rooms/a508cc53-02f5-45a2-948e-c6dc56253fb9/watch", 302);
+        return Response.redirect("https://muse-jansou.muse-jansou.workers.dev/rooms/c4c3d9be-ed74-458d-8956-11bd345c477c/watch", 302);
+      }
+      if (path === "/w2" && request.method === "GET") {
+        return Response.redirect("https://muse-jansou.muse-jansou.workers.dev/rooms/06bf8829-4b64-4da6-b8f1-c6c8173ca4d0/watch", 302);
+      }
+      if ((path === "/t" || path === "/tables") && request.method === "GET") {
+        return new Response(TABLES_HTML, {
+          headers: { "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store" },
+        });
       }
       if (path === "/rooms" && request.method === "POST") {
         if (!dev && !env.MASTER_TOKEN) return json({ error: "MASTER_TOKEN not configured" }, 503);
@@ -180,7 +200,7 @@ export default {
         }, 201);
       }
 
-      const m = path.match(/^\/rooms\/([^/]+)\/(state|leave|vacate|queue\/leave|queue-status|queue|events|paipu|proxy|actions|claim|invites|join|spectators\/support|spectators|cheers\/flag|cheer-settings|cheers|seat-tokens|watch-password|watch-open|watch|debug|dev\/advance-time)$/);
+      const m = path.match(/^\/rooms\/([^/]+)\/(state|watch-digest|hands\/latest|leave|vacate|rematch|queue\/leave|queue-status|queue|events|watch-events|paipu|proxy|profile|actions|claim|invites|join|spectators\/support|spectators|cheers\/flag|cheer-settings|cheers|seat-tokens|watch-password|watch-open|watch|debug|dev\/advance-time)$/);
       if (!m) return json({ error: "not found" }, 404);
       const roomId = m[1];
       const suffix = m[2];
@@ -217,7 +237,7 @@ export default {
         if (new TextEncoder().encode(raw).byteLength > MAX_FORWARD_BYTES) return json({ error: "request too large" }, 413);
         init.body = raw;
       }
-      const query = (suffix === "events" || suffix === "cheers") ? url.search : "";
+      const query = (suffix === "events" || suffix === "watch-events" || suffix === "cheers" || suffix === "watch-digest" || suffix === "paipu") ? url.search : "";
       return stub.fetch("https://do/" + suffix + query, init);
     } catch (error) {
       console.error("Worker request failed", error);

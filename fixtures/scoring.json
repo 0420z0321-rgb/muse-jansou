@@ -1,0 +1,280 @@
+{
+ "kind": "scoring",
+ "cases": [
+  {
+   "case_id": "pinfu_tanyao_ron",
+   "input": {
+    "hand": [
+     1,
+     2,
+     3,
+     10,
+     11,
+     12,
+     14,
+     15,
+     16,
+     20,
+     21,
+     25,
+     25,
+     22
+    ],
+    "win_tile": 22,
+    "win_type": "ron",
+    "seat_wind": 1,
+    "round_wind": 0,
+    "riichi": false,
+    "melds": []
+   },
+   "expected": {
+    "valid": true,
+    "han": 2,
+    "fu": 30,
+    "yaku": [
+     "平和",
+     "断么九"
+    ],
+    "payments": {
+     "ron": 2000
+    }
+   }
+  },
+  {
+   "case_id": "pinfu_tanyao_riichi_ron",
+   "input": {
+    "hand": [
+     1,
+     2,
+     3,
+     10,
+     11,
+     12,
+     14,
+     15,
+     16,
+     20,
+     21,
+     25,
+     25,
+     22
+    ],
+    "win_tile": 22,
+    "win_type": "ron",
+    "seat_wind": 1,
+    "round_wind": 0,
+    "riichi": true,
+    "melds": []
+   },
+   "expected": {
+    "valid": true,
+    "han": 3,
+    "fu": 30,
+    "yaku": [
+     "平和",
+     "断么九",
+     "立直"
+    ],
+    "payments": {
+     "ron": 3900
+    }
+   }
+  },
+  {
+   "case_id": "chiitoi_tanyao_ron",
+   "input": {
+    "hand": [
+     10,
+     10,
+     11,
+     11,
+     14,
+     14,
+     15,
+     15,
+     20,
+     20,
+     21,
+     21,
+     23,
+     23
+    ],
+    "win_tile": 23,
+    "win_type": "ron",
+    "seat_wind": 2,
+    "round_wind": 0,
+    "riichi": false,
+    "melds": []
+   },
+   "expected": {
+    "valid": true,
+    "han": 3,
+    "fu": 25,
+    "yaku": [
+     "七対子",
+     "断么九"
+    ],
+    "payments": {
+     "ron": 3200
+    }
+   }
+  },
+  {
+   "case_id": "yakuhai_haku_ron",
+   "input": {
+    "hand": [
+     31,
+     31,
+     31,
+     0,
+     1,
+     2,
+     12,
+     13,
+     14,
+     26,
+     26,
+     23,
+     24,
+     25
+    ],
+    "win_tile": 25,
+    "win_type": "ron",
+    "seat_wind": 1,
+    "round_wind": 0,
+    "riichi": false,
+    "melds": []
+   },
+   "expected": {
+    "valid": true,
+    "han": 1,
+    "fu": 40,
+    "yaku": [
+     "役牌"
+    ],
+    "payments": {
+     "ron": 1300
+    }
+   }
+  },
+  {
+   "case_id": "menzen_tsumo_only",
+   "input": {
+    "hand": [
+     0,
+     1,
+     2,
+     6,
+     7,
+     8,
+     9,
+     10,
+     11,
+     27,
+     27,
+     21,
+     22,
+     20
+    ],
+    "win_tile": 20,
+    "win_type": "tsumo",
+    "seat_wind": 1,
+    "round_wind": 0,
+    "riichi": false,
+    "melds": []
+   },
+   "expected": {
+    "valid": true,
+    "han": 1,
+    "fu": 30,
+    "yaku": [
+     "門前清自摸和"
+    ],
+    "payments": {
+     "tsumo_dealer": 500,
+     "tsumo_other": 300,
+     "total": 1100
+    }
+   }
+  },
+  {
+   "case_id": "yakunashi_ron_invalid",
+   "input": {
+    "hand": [
+     0,
+     1,
+     2,
+     6,
+     7,
+     8,
+     9,
+     10,
+     11,
+     27,
+     27,
+     21,
+     22,
+     20
+    ],
+    "win_tile": 20,
+    "win_type": "ron",
+    "seat_wind": 1,
+    "round_wind": 0,
+    "riichi": false,
+    "melds": []
+   },
+   "expected": {
+    "valid": false,
+    "han": null,
+    "fu": null,
+    "yaku": null,
+    "payments": null
+   }
+  },
+  {
+   "case_id": "pon_yakuhai_ron",
+   "input": {
+    "hand": [
+     1,
+     2,
+     3,
+     10,
+     11,
+     12,
+     14,
+     15,
+     16,
+     20,
+     20
+    ],
+    "win_tile": 20,
+    "win_type": "ron",
+    "seat_wind": 1,
+    "round_wind": 0,
+    "riichi": false,
+    "melds": [
+     {
+      "type": "pon",
+      "tiles": [
+       31,
+       31,
+       31
+      ],
+      "open": true
+     }
+    ]
+   },
+   "expected": {
+    "valid": true,
+    "han": 1,
+    "fu": 30,
+    "yaku": [
+     "役牌"
+    ],
+    "payments": {
+     "ron": 1000
+    }
+   }
+  }
+ ]
+}

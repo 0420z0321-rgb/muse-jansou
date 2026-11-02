@@ -1,0 +1,1 @@
+{"description":"Muse雀荘 Python参照実装のTypeScript移植（Phase 2：第1層ルール＋第2層状態機械）","name":"muse-jansou-ts","private":true,"scripts":{"check-fixtures":"node fixtures_check.ts","play":"node play_bots.ts","typecheck":"tsc --noEmit"},"type":"module","version":"0.1.0","devDependencies":{"@types/node":"^26.6.6","typescript":"^7.0.2"}}

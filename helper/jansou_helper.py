@@ -934,6 +934,9 @@ def build_action(config: dict, state: dict, identity: str, action: dict,
         if kind != "discard":
             raise HelperError("--riichi はdiscardにだけ指定できます。")
         request["riichi"] = True
+    # プロンプト代打ちとしての打牌（予約制の回数に数えられる）。
+    if getattr(args, "via_prompt", False):
+        request["via"] = "prompt"
     if args.claim_json:
         if kind != "declare_score":
             raise HelperError("--claim-json はdeclare_scoreにだけ指定できます。")
@@ -1387,6 +1390,22 @@ def cmd_cheer_flag(args: argparse.Namespace, files: SecureFiles) -> int:
 
 # ---- Phase R2: optional seat hand-off and FIFO waiting queue ----
 
+def cmd_proxy(args: argparse.Namespace, files: SecureFiles) -> int:
+    """Declare or clear the prompt-proxy reservation for this Player seat."""
+    with files.lock():
+        config, api = load_context(files, args.timeout)
+        require_role(config, "player", "proxy")
+        reply = api.call("POST", "proxy", {"active": args.state == "on"})
+        if reply.get("ok") is not True:
+            raise HelperError("予約宣言の成功応答を確認できません。")
+        if args.state == "on":
+            print("プロンプト代打ちの予約を宣言しました（席%d）。" % config["seat"])
+            print("代打ちの手は act --via-prompt で送ってください。本人が打つと予約は終わり、代打ちが%d回打つと席は待ち列へ交代します。" % int(reply.get("proxy_max_plays") or 5))
+        else:
+            print("プロンプト代打ちの予約を取り消しました（席%d）。" % config["seat"])
+    return 0
+
+
 def cmd_leave(args: argparse.Namespace, files: SecureFiles) -> int:
     """Leave this Player seat; the former credential is then locally removed."""
     with files.lock():
@@ -1583,6 +1602,7 @@ def parser() -> argparse.ArgumentParser:
     a.add_argument("--riichi", action="store_true", help="選んだdiscardにリーチを付ける")
     a.add_argument("--claim-json", help="declare_score用にMuseが計算した申告JSON")
     a.add_argument("--retry-pending", action="store_true", help="未確定POSTを同一キーで再送")
+    a.add_argument("--via-prompt", action="store_true", help="プロンプト代打ちとしての打牌（予約宣言中のみ有効）")
 
     subs.add_parser("pending", help="未確定POSTの有無を秘密なしで表示")
     clear = subs.add_parser("clear-pending", help="未確定POSTを明示的に破棄")
@@ -1614,6 +1634,8 @@ def parser() -> argparse.ArgumentParser:
     flag.add_argument("seq", type=int, help="cheersのコメントseq")
 
     subs.add_parser("leave", help="現在のPlayer資格を失効させ席を退室")
+    proxy = subs.add_parser("proxy", help="プロンプト代打ちの予約を宣言/取消（自分の席のみ）")
+    proxy.add_argument("state", choices=["on", "off"], help="on=予約開始、off=予約取消")
     q = subs.add_parser("queue", help="待ち列へ参加（資格はローカル保存）")
     q.add_argument("--name", help="表示名（省略時は以前の設定）")
     q.add_argument("--icon", help="アイコン用絵文字")
@@ -1649,6 +1671,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "cheers": cmd_cheers,
             "cheer-flag": cmd_cheer_flag,
             "leave": cmd_leave,
+            "proxy": cmd_proxy,
             "queue": cmd_queue,
             "queue-status": cmd_queue_status,
             "queue-leave": cmd_queue_leave,

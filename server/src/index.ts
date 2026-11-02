@@ -79,6 +79,7 @@ const METHODS: Record<string, "GET" | "POST" | "BOTH"> = {
   state: "GET",
   events: "GET",
   paipu: "GET",
+  proxy: "POST",
   actions: "POST",
   claim: "POST",
   invites: "POST",
@@ -125,7 +126,7 @@ export default {
       // Short links for chat-room posts: long file URLs trip the main
       // room's privacy filter (long_number). Targets are public.
       if (path === "/k" && request.method === "GET") {
-        return Response.redirect("https://muse.ai/files/1360881390449688/1105768832086918/rqbktsgku740ta3e724yc3ry/jansou-kit-v9.zip", 302);
+        return Response.redirect("https://muse.ai/files/1360881390449688/1412549240587868/7m02umsuod72d0a8069q0j4y/jansou-kit-v10.zip", 302);
       }
       if (path === "/s" && request.method === "GET") {
         return Response.redirect("https://muse.ai/files/1360881390449688/1641330841069541/1qwslg7f0kbevgzbfniuhyae/senbra-low-package.zip", 302);
@@ -179,7 +180,7 @@ export default {
         }, 201);
       }
 
-      const m = path.match(/^\/rooms\/([^/]+)\/(state|leave|vacate|queue\/leave|queue-status|queue|events|paipu|actions|claim|invites|join|spectators\/support|spectators|cheers\/flag|cheer-settings|cheers|seat-tokens|watch-password|watch-open|watch|debug|dev\/advance-time)$/);
+      const m = path.match(/^\/rooms\/([^/]+)\/(state|leave|vacate|queue\/leave|queue-status|queue|events|paipu|proxy|actions|claim|invites|join|spectators\/support|spectators|cheers\/flag|cheer-settings|cheers|seat-tokens|watch-password|watch-open|watch|debug|dev\/advance-time)$/);
       if (!m) return json({ error: "not found" }, 404);
       const roomId = m[1];
       const suffix = m[2];

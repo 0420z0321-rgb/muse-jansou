@@ -230,6 +230,12 @@ type Invite = {
 type Viewer = Pick<Principal, "role" | "seat"> & { participant_id?: string };
 const MAX_EVENTS_PAGE = 50;
 const RETAIN_EVENTS = 500;
+/** Consecutive server timeouts (clocked rooms) that force a seat rotation. */
+const TIMEOUT_ROTATE_AFTER = 2;
+/** Free deadline extension granted once to a freshly seated holder. */
+const ROTATION_GRACE_MS = 60_000;
+/** Proxy plays a declared prompt fill-in may make before the seat rotates. */
+const PROXY_MAX_PLAYS = 5;
 // Paipu archives survive the events trim; only the newest few finished
 // matches are kept per room (same horizon as recentMatchResults).
 const PAIPU_RETAINED_MATCHES = 5;
@@ -861,6 +867,21 @@ export class RoomDO extends DurableObject {
   /** Commit a proposed Game atomically, then change the memory cache. */
   private commitGame(next: Game, options: PersistOptions): void {
     const previous = this.game;
+    // Rotation grace: a seat whose holder just changed carries a one-time
+    // flag; the first deadline armed for that seat is extended by a free
+    // minute (deadline only — the bank is not charged for it). Fill-in
+    // (bootstrap) play never sets the flag, so it never receives grace.
+    if (next.clock !== null && next.dec_deadlines) {
+      const deadlines = next.dec_deadlines as Record<string, { deadline: number; grace_ms?: number }>;
+      for (let seat = 0; seat < 4; seat++) {
+        const entry = deadlines[String(seat)];
+        if (!entry || entry.grace_ms) continue;
+        if (this.metaGet(`rotation_grace:${seat}`) !== "1") continue;
+        entry.deadline += ROTATION_GRACE_MS;
+        entry.grace_ms = ROTATION_GRACE_MS;
+        this.metaSet(`rotation_grace:${seat}`, "0");
+      }
+    }
     const snapshot = JSON.stringify(next);
     const snapshotBytes = new TextEncoder().encode(snapshot).byteLength;
     this.ctx.storage.transactionSync(() => {
@@ -911,6 +932,7 @@ export class RoomDO extends DurableObject {
   private settleNow(kind: "lazy_settle" | "alarm_settle"): boolean {
     if (this.game === null) return false;
     this.injectTime();
+    const logBefore = this.game.clock_log?.length ?? 0;
     const next = structuredClone(this.game);
     const changed = settleExpired(next);
     if (!changed) return false;
@@ -918,7 +940,34 @@ export class RoomDO extends DurableObject {
       logKind: kind,
       logPayload: { revision: next.revision, decision_id: next.decision_id },
     });
+    this.processTimeoutsTx(logBefore, next);
     return true;
+  }
+
+  /**
+   * Timeout rotation (clocked rooms): a holder who lets the server play
+   * TIMEOUT_ROTATE_AFTER decisions in a row loses the seat to the queue.
+   * Timeouts on open seats (fill-in territory) never count, and a single
+   * voluntary action by the holder resets the streak (see handleActions).
+   */
+  private processTimeoutsTx(logBefore: number, next: Game): void {
+    const fresh = (next.clock_log ?? []).slice(logBefore)
+      .filter(entry => isObject(entry) && entry.timed_out === true && isInt(entry.seat));
+    if (fresh.length === 0) return;
+    const seats = [...new Set(fresh.map(entry => Number((entry as { seat: unknown }).seat)))];
+    this.ctx.storage.transactionSync(() => {
+      for (const seat of seats) {
+        const holder = this.currentHolder(seat);
+        if (holder === null) continue;
+        const streak = Number(this.metaGet(`timeout_streak:${seat}`) ?? "0") + 1;
+        if (streak >= TIMEOUT_ROTATE_AFTER) {
+          this.opsLog("seat_timeout_rotation", { participant_id: holder.participant_id, seat, streak });
+          this.vacateSeatTx(seat);
+        } else {
+          this.metaSet(`timeout_streak:${seat}`, String(streak));
+        }
+      }
+    });
   }
 
   // ---- Clock / Alarm ----
@@ -1200,6 +1249,13 @@ export class RoomDO extends DurableObject {
         "INSERT INTO rotation_seat_holders (seat, participant_id, token_hash, assigned_at, source) VALUES (?, ?, ?, ?, 'queue')",
         seat, participant, hash, now,
       );
+      // A freshly seated holder starts with a clean timeout streak and a
+      // one-time grace extension on their first deadline (see commitGame).
+      // Fill-in (bootstrap) play never sets this flag.
+      this.metaSet(`timeout_streak:${seat}`, "0");
+      this.metaSet(`rotation_grace:${seat}`, "1");
+      this.metaSet(`proxy_active:${seat}`, "0");
+      this.metaSet(`proxy_count:${seat}`, "0");
       this.ctx.storage.sql.exec(
         "UPDATE rotation_queue SET status = 'promoted', seat = ?, participant_id = ?, grant_nonce = ?, promoted_at = ? WHERE id = ? AND status = 'waiting'",
         seat, participant, salt, now, id,
@@ -1401,6 +1457,8 @@ export class RoomDO extends DurableObject {
       this.ctx.storage.sql.exec(
         "DELETE FROM rotation_seat_holders WHERE seat = ? AND token_hash = ?", seat, who.token_hash,
       );
+      this.metaSet(`proxy_active:${seat}`, "0");
+      this.metaSet(`proxy_count:${seat}`, "0");
       this.opsLog("player_left", { participant_id: who.participant_id, seat });
       const promoted = this.promoteWaitingTx();
       data = { ok: true, seat, open: this.currentHolder(seat) === null, promoted: promoted > 0 };
@@ -1410,6 +1468,35 @@ export class RoomDO extends DurableObject {
 
   /** Master-initiated seat vacating (timeout rotation): same effects as
    *  /leave, but triggered by the room master for a stalled holder. */
+  /**
+   * Prompt-proxy reservation: a current holder declares that their own
+   * prompt fill-in will play the seat (actions marked via:"prompt").
+   * The reservation ends when the holder plays in person again; if the
+   * fill-in reaches PROXY_MAX_PLAYS plays first, the seat rotates.
+   */
+  private async handleProxy(request: Request, who: Principal): Promise<Response> {
+    if (who.role !== "player" || who.seat === null ||
+        who.participant_id.startsWith("bootstrap:")) {
+      return json({ error: "only current non-bootstrap player may declare proxy" }, 403);
+    }
+    const parsed = await readJsonObject(request);
+    if (parsed instanceof Response) return parsed;
+    if (typeof parsed.active !== "boolean") return json({ error: "active boolean required" }, 400);
+    const seat = who.seat;
+    let status = 200;
+    let data: JsonObject = {};
+    this.ctx.storage.transactionSync(() => {
+      if (!this.canOperateSeat(who, seat)) {
+        status = 403; data = { error: "not current seat holder" }; return;
+      }
+      this.metaSet(`proxy_active:${seat}`, parsed.active ? "1" : "0");
+      this.metaSet(`proxy_count:${seat}`, "0");
+      this.opsLog(parsed.active ? "proxy_declared" : "proxy_cleared", { participant_id: who.participant_id, seat });
+      data = { ok: true, seat, proxy_active: parsed.active, proxy_plays: 0, proxy_max_plays: PROXY_MAX_PLAYS };
+    });
+    return json(data, status);
+  }
+
   private async handleVacate(request: Request, who: Principal): Promise<Response> {
     if (who.role !== "master") return json({ error: "forbidden" }, 403);
     const parsed = await readJsonObject(request);
@@ -1420,19 +1507,31 @@ export class RoomDO extends DurableObject {
     }
     let data: JsonObject = {};
     this.ctx.storage.transactionSync(() => {
-      const holder = this.currentHolder(seat);
-      if (holder === null) {
-        data = { ok: true, seat, open: true, vacated: false };
-        return;
-      }
-      this.ctx.storage.sql.exec("UPDATE credentials SET enabled = 0 WHERE token_hash = ?", holder.token_hash);
-      this.ctx.storage.sql.exec("DELETE FROM leases WHERE seat = ?", seat);
-      this.ctx.storage.sql.exec("DELETE FROM rotation_seat_holders WHERE seat = ?", seat);
-      this.opsLog("seat_vacated", { participant_id: holder.participant_id, seat });
-      const promoted = this.promoteWaitingTx();
-      data = { ok: true, seat, open: this.currentHolder(seat) === null, vacated: true, promoted: promoted > 0 };
+      const result = this.vacateSeatTx(seat);
+      data = result.vacated
+        ? { ok: true, seat, open: this.currentHolder(seat) === null, vacated: true, promoted: result.promoted > 0 }
+        : { ok: true, seat, open: true, vacated: false };
     });
     return json(data, 200);
+  }
+
+  /**
+   * Revoke the seat's holder and promote the queue head, if any.
+   * Must be called inside a storage transaction. Shared by the master
+   * vacate endpoint and the timeout-rotation path.
+   */
+  private vacateSeatTx(seat: number): { vacated: boolean; promoted: number } {
+    const holder = this.currentHolder(seat);
+    if (holder === null) return { vacated: false, promoted: 0 };
+    this.ctx.storage.sql.exec("UPDATE credentials SET enabled = 0 WHERE token_hash = ?", holder.token_hash);
+    this.ctx.storage.sql.exec("DELETE FROM leases WHERE seat = ?", seat);
+    this.ctx.storage.sql.exec("DELETE FROM rotation_seat_holders WHERE seat = ?", seat);
+    this.metaSet(`timeout_streak:${seat}`, "0");
+    this.metaSet(`proxy_active:${seat}`, "0");
+    this.metaSet(`proxy_count:${seat}`, "0");
+    this.opsLog("seat_vacated", { participant_id: holder.participant_id, seat });
+    const promoted = this.promoteWaitingTx();
+    return { vacated: true, promoted };
   }
 
   private async handleWatchPassword(request: Request, who: Principal): Promise<Response> {
@@ -1465,12 +1564,16 @@ export class RoomDO extends DurableObject {
       participant_count: number;
       participants: PublicPlayer[];
       open: boolean;
+      proxy: boolean;
+      proxy_plays: number;
     };
     type SpectatorGroup = { count: number; names: string[] };
 
     const seats: SeatSummary[] = Array.from({ length: 4 }, (_, seat) => ({
       seat, joined: false, in_match: false, display_name: null, icon: null,
       participant_count: 0, participants: [], open: this.currentHolder(seat) === null,
+      proxy: this.metaGet(`proxy_active:${seat}`) === "1",
+      proxy_plays: Number(this.metaGet(`proxy_count:${seat}`) ?? "0"),
     }));
     const bySeat: Array<SpectatorGroup & { seat: number }> =
       Array.from({ length: 4 }, (_, seat) => ({ seat, count: 0, names: [] }));
@@ -1847,6 +1950,10 @@ export class RoomDO extends DurableObject {
             "INSERT INTO rotation_seat_holders (seat, participant_id, token_hash, assigned_at, source) VALUES (?, ?, ?, ?, 'invite')",
             seat, pid, hash, now,
           );
+          this.metaSet(`timeout_streak:${seat}`, "0");
+          this.metaSet(`rotation_grace:${seat}`, "1");
+          this.metaSet(`proxy_active:${seat}`, "0");
+          this.metaSet(`proxy_count:${seat}`, "0");
         }
       }
       this.opsLog("participant_joined", { participant_id: pid, role, seat });
@@ -2066,6 +2173,7 @@ export class RoomDO extends DurableObject {
       }
       if (path === "/leave" && request.method === "POST") return await this.handleLeave(principal);
       if (path === "/vacate" && request.method === "POST") return await this.handleVacate(request, principal);
+      if (path === "/proxy" && request.method === "POST") return await this.handleProxy(request, principal);
       if (path === "/state" && request.method === "GET") return await this.handleState(principal);
       if (path === "/events" && request.method === "GET") return await this.handleEvents(request, principal);
       if (path === "/paipu" && request.method === "GET") return await this.handlePaipu(request, principal);
@@ -2248,6 +2356,32 @@ export class RoomDO extends DurableObject {
       logPayload: { participant_id: who.participant_id, seat, action: body.action, decision_id: decisionId },
       action: { idemKey, requestHash: hash, response: result, statusCode: 200, consumedSeat: seat, decisionId },
     });
+    // A voluntary action by the seat's current holder resets their timeout
+    // streak. Bootstrap (fill-in) actions never reset it.
+    if (who.role === "player" && this.currentHolder(seat)?.participant_id === who.participant_id) {
+      this.ctx.storage.transactionSync(() => {
+        this.metaSet(`timeout_streak:${seat}`, "0");
+        // Prompt-proxy reservation: while declared, plays marked
+        // via:"prompt" are the holder's own prompt fill-in playing. The
+        // holder must return in person before PROXY_MAX_PLAYS such plays;
+        // a personal (unmarked) action ends the reservation, and reaching
+        // the cap rotates the seat to the queue.
+        if (this.metaGet(`proxy_active:${seat}`) === "1") {
+          if (body.via === "prompt") {
+            const plays = Number(this.metaGet(`proxy_count:${seat}`) ?? "0") + 1;
+            this.metaSet(`proxy_count:${seat}`, String(plays));
+            if (plays >= PROXY_MAX_PLAYS) {
+              this.opsLog("seat_proxy_expired", { participant_id: who.participant_id, seat, plays });
+              this.vacateSeatTx(seat);
+            }
+          } else {
+            this.metaSet(`proxy_active:${seat}`, "0");
+            this.metaSet(`proxy_count:${seat}`, "0");
+            this.opsLog("proxy_returned", { participant_id: who.participant_id, seat });
+          }
+        }
+      });
+    }
     await this.syncIfNeeded(true);
     return json(result);
   }
@@ -2333,6 +2467,7 @@ export class RoomDO extends DurableObject {
       this.timeOffsetMs + (parsed.advance_ms as number);
     if (!isInt(candidate)) return json({ error: "invalid time offset" }, 400);
 
+    const logBefore = this.game!.clock_log?.length ?? 0;
     const next = structuredClone(this.game!);
     this.injectTime(candidate);
     let changed: boolean;
@@ -2364,6 +2499,7 @@ export class RoomDO extends DurableObject {
     if (changed) {
       this.game = next;
       this.savedRevision = next.revision;
+      this.processTimeoutsTx(logBefore, next);
     }
     await this.syncAlarmSafely(); // Always required when real<->engine clock mapping changes.
     this.injectTime();

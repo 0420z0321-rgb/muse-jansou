@@ -1167,6 +1167,43 @@ def cmd_events(args: argparse.Namespace, files: SecureFiles) -> int:
 def cmd_paipu(args: argparse.Namespace, files: SecureFiles) -> int:
     with files.lock():
         config, api = load_context(files, args.timeout)
+        if args.list:
+            raw = api.call_raw("GET", "paipu", query={"list": "1"})
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                raise HelperError("対局一覧の応答がJSONではありません。")
+            matches = payload.get("matches") if is_obj(payload) else None
+            if not isinstance(matches, list):
+                raise HelperError("対局一覧の形式が不正です。")
+            if not matches:
+                print("終了した半荘はまだありません。")
+                return 0
+            print("終了した半荘（新しい順）:")
+            for i, m in enumerate(matches, 1):
+                if not is_obj(m):
+                    continue
+                finished = m.get("finished_at")
+                when = "?"
+                if is_int(finished):
+                    when = dt.datetime.fromtimestamp(
+                        finished / 1000, dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+                standings = []
+                results = m.get("results")
+                if isinstance(results, list):
+                    for r in results:
+                        if is_obj(r):
+                            standings.append("%s位 %s（%s点）" % (
+                                r.get("rank", "?"), r.get("display_name", "?"), r.get("score", "?")))
+                print("%d. %s  match_key=%s" % (i, when, m.get("match_key", "?")))
+                if standings:
+                    print("   " + " / ".join(standings))
+                if m.get("paipu_available"):
+                    print("   牌譜あり（イベント%s件）: paipu --match %s で取得" % (
+                        m.get("event_count", "?"), m.get("match_key", "?")))
+                else:
+                    print("   牌譜は保存期間を過ぎています（結果のみ残っています）")
+            return 0
         query = {}
         if args.match:
             query["match"] = args.match
@@ -1618,6 +1655,7 @@ def parser() -> argparse.ArgumentParser:
     p = subs.add_parser("paipu", help="終了した半荘の牌譜（NDJSON）をダウンロード")
     p.add_argument("--match", help="match_key（省略時は最新の終了済み半荘）")
     p.add_argument("--out", help="保存先ファイル（省略時は paipu-<match_key>.ndjson）")
+    p.add_argument("--list", action="store_true", help="終了済み半荘の一覧（match_key・結果・牌譜の有無）を表示")
     support = subs.add_parser("support", help="Spectatorの応援席を変更（半荘終了後のみ）")
     support.add_argument("seat", type=int, choices=range(4), help="応援する席0～3")
 

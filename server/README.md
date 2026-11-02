@@ -41,6 +41,7 @@ DO がメモリから落ちても、コンストラクタでスナップショ�
 | `GET /` | ヘルスチェック |
 | `POST /rooms` | 卓を作成。body：`{ seed?, ruleset?, time_offset_ms? }` → `201 { room_id, token, state }` |
 | `GET /rooms/{id}/state` | public_state。入口で期限切れを遅延 settle する |
+| `GET /rooms/{id}/paipu` | 終了した半荘の牌譜（NDJSON）を書き出す。`?match=<match_key>` で指定、省略時は最新の終了半荘。形式は `PAIPU.md` |
 | `POST /rooms/{id}/actions` | apply_action。body に `idempotency_key`（任意）と `claim_token`（lease がある場合）を含められる |
 | `POST /rooms/{id}/claim` | 現在の decision への lease 発行。body：`{ seat? }` → `{ claim_token, decision_id, seat, expires_at, reused }` |
 | `GET /rooms/{id}/debug` | 開発検証用（settle しない）：revision / lease / alarm_count など |

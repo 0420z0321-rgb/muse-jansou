@@ -257,6 +257,7 @@ type QueueRow = {
   seat: number | null;
   participant_id: string | null;
   grant_nonce: string | null;
+  player_token_hash: string | null;
 };
 
 
@@ -1228,6 +1229,44 @@ export class RoomDO extends DurableObject {
       holder.token_hash === who.token_hash;
   }
 
+  /** Return a promoted-but-unredeemed queue row to 'waiting', FIFO place
+   *  intact (its id is unchanged, so it stays ahead of later arrivals). */
+  private revertQueuePromotionTx(id: number, seat: number | null, via: string): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE rotation_queue SET status = 'waiting', seat = NULL, participant_id = NULL, grant_nonce = NULL, promoted_at = NULL WHERE id = ?",
+      id,
+    );
+    this.opsLog("queue_promotion_reverted", { queue_id: id, seat, via });
+  }
+
+  /**
+   * Settle the rotation_queue row behind a seat claim that is ending
+   * (leave / vacate / timeout rotation). An unredeemed promotion — the
+   * provisional holder never polled queue-status, so no Player credential
+   * was ever issued — returns to 'waiting'; a redeemed claim is closed as
+   * 'left'. Callers invoke this AFTER promoteWaitingTx() so a reverted
+   * row is not instantly re-promoted into the seat just vacated. Without
+   * this, the queue row stayed 'promoted' forever once its holder was
+   * gone: queue-status 409-looped, queue-leave rejected it as already
+   * promoted, and re-queueing returned the stale row.
+   */
+  private settleQueueClaimTx(seat: number, participantId: string): void {
+    const row = this.ctx.storage.sql.exec(
+      "SELECT id, player_token_hash FROM rotation_queue WHERE status = 'promoted' AND seat = ? AND participant_id = ?",
+      seat, participantId,
+    ).toArray()[0];
+    if (!row) return;
+    const id = Number(row.id);
+    if (row.player_token_hash === null) {
+      this.revertQueuePromotionTx(id, seat, "settle");
+    } else {
+      this.ctx.storage.sql.exec(
+        "UPDATE rotation_queue SET status = 'left', left_at = ? WHERE id = ?", Date.now(), id,
+      );
+      this.opsLog("queue_claim_closed", { queue_id: id, seat });
+    }
+  }
+
   /** FIFO promotion, low-numbered open seat first. Never returns a token. */
   private promoteWaitingTx(): number {
     let promoted = 0;
@@ -1275,7 +1314,7 @@ export class RoomDO extends DurableObject {
 
   private queueEntry(hash: string): QueueRow | null {
     const row = this.ctx.storage.sql.exec(
-      "SELECT id, queue_hash, display_name, icon, status, seat, participant_id, grant_nonce FROM rotation_queue WHERE queue_hash = ?",
+      "SELECT id, queue_hash, display_name, icon, status, seat, participant_id, grant_nonce, player_token_hash FROM rotation_queue WHERE queue_hash = ?",
       hash,
     ).toArray()[0];
     return row ? {
@@ -1285,6 +1324,7 @@ export class RoomDO extends DurableObject {
       status: String(row.status), seat: row.seat === null ? null : Number(row.seat),
       participant_id: row.participant_id === null ? null : String(row.participant_id),
       grant_nonce: row.grant_nonce === null ? null : String(row.grant_nonce),
+      player_token_hash: row.player_token_hash === null ? null : String(row.player_token_hash),
     } : null;
   }
 
@@ -1389,12 +1429,22 @@ export class RoomDO extends DurableObject {
     const playerHash = await sha256Hex(playerToken);
     let status = 200;
     let failure: JsonObject | null = null;
+    let reverted = false;
     this.ctx.storage.transactionSync(() => {
       const fresh = this.queueEntry(secret.hash);
       const holder = this.currentHolder(row.seat!);
       if (!fresh || fresh.status !== "promoted" || !holder ||
           holder.participant_id !== row.participant_id ||
           (holder.token_hash !== secret.hash && holder.token_hash !== playerHash)) {
+        // Legacy orphan: the claim ended before redemption and the row was
+        // stranded in 'promoted' (see settleQueueClaimTx). If no Player
+        // credential was ever issued for it, return it to 'waiting'
+        // instead of 409-looping the owner forever.
+        if (fresh && fresh.status === "promoted" && fresh.player_token_hash === null) {
+          this.revertQueuePromotionTx(fresh.id, row.seat, "queue-status");
+          reverted = true;
+          return;
+        }
         status = 409; failure = { error: "queue promotion no longer active" }; return;
       }
       if (holder.token_hash === secret.hash) {
@@ -1412,6 +1462,10 @@ export class RoomDO extends DurableObject {
         this.opsLog("queue_credential_issued", { queue_id: row.id, seat: row.seat });
       }
     });
+    if (reverted) {
+      return json({ status: "waiting", position: this.queuePosition(row.id),
+        display_name: row.display_name });
+    }
     if (failure !== null) return json(failure, status);
     return json({ status: "promoted", role: "player", seat: row.seat,
       display_name: row.display_name, icon: row.icon ?? "", participant_id: row.participant_id,
@@ -1461,6 +1515,7 @@ export class RoomDO extends DurableObject {
       this.metaSet(`proxy_count:${seat}`, "0");
       this.opsLog("player_left", { participant_id: who.participant_id, seat });
       const promoted = this.promoteWaitingTx();
+      this.settleQueueClaimTx(seat, who.participant_id);
       data = { ok: true, seat, open: this.currentHolder(seat) === null, promoted: promoted > 0 };
     });
     return json(data, status);
@@ -1531,6 +1586,7 @@ export class RoomDO extends DurableObject {
     this.metaSet(`proxy_count:${seat}`, "0");
     this.opsLog("seat_vacated", { participant_id: holder.participant_id, seat });
     const promoted = this.promoteWaitingTx();
+    this.settleQueueClaimTx(seat, holder.participant_id);
     return { vacated: true, promoted };
   }
 

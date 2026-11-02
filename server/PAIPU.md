@@ -21,6 +21,29 @@ Authorization: Bearer <token>   （Master / Player / Spectator いずれも可�
 - 応答は `application/x-ndjson`、`Content-Disposition: attachment` で
   ファイルとして返す。Helper では `jansou_helper.py paipu` で保存できる。
 
+### 終了した半荘の一覧（選んで取得するために）
+
+```
+GET /rooms/{roomId}/paipu?list=1
+Authorization: Bearer <token>   （Master / Player / Spectator いずれも可）
+```
+
+`match_key` は内部由来の文字列で、利用者が事前に知る手段がなかったため、
+終了済み半荘の一覧を JSON で返す。新しい順に最大50件。
+
+```json
+{ "matches": [
+  { "match_key": "…", "finished_at": 1793600000000, "event_count": 1523,
+    "paipu_available": true,
+    "results": [ { "display_name": "…", "score": 32700, "rank": 1 }, … ] }
+] }
+```
+
+- `paipu_available` が false の対局は、保持期間（直近5半荘）を過ぎて
+  牌譜本体は削除済みで、結果のみが残っている（`event_count` は 0）。
+- Helper では `jansou_helper.py paipu --list` で一覧を表示でき、
+  選んだ対局を `jansou_helper.py paipu --match <match_key>` で取得する。
+
 ### エラー
 
 | 状態 | error | 意味 |

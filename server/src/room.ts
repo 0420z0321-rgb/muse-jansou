@@ -1732,9 +1732,41 @@ export class RoomDO extends DurableObject {
    * The stored snapshots are full-information, so export is limited to
    * matches already recorded as finished in ranking_matches; a match in
    * progress is never exportable. Any enabled credential may download.
+   *
+   * With ?list=1 the endpoint instead returns a JSON index of recorded
+   * finished matches (newest first), so a reader can discover match keys
+   * and pick one: { matches: [{ match_key, finished_at, event_count,
+   * paipu_available, results }] }. event_count is 0 once the archive has
+   * been pruned by the retention policy (paipu_available: false).
    */
   private async handlePaipu(request: Request, who: Principal): Promise<Response> {
-    const requested = new URL(request.url).searchParams.get("match");
+    const params = new URL(request.url).searchParams;
+    if (params.has("list")) {
+      const matches = this.ctx.storage.sql.exec(
+        "SELECT m.match_key AS match_key, m.finished_at AS finished_at, " +
+        "(SELECT COUNT(*) FROM paipu_events p WHERE p.match_key = m.match_key) AS event_count " +
+        "FROM ranking_matches m ORDER BY m.finished_at DESC, m.match_key DESC LIMIT 50",
+      ).toArray().map(row => {
+        const eventCount = Number(row.event_count);
+        const results = this.ctx.storage.sql.exec(
+          "SELECT display_name, score, rank FROM ranking_results WHERE match_key = ? ORDER BY rank, seat",
+          String(row.match_key),
+        ).toArray().map(r => ({
+          display_name: String(r.display_name),
+          score: Number(r.score),
+          rank: Number(r.rank),
+        }));
+        return {
+          match_key: String(row.match_key),
+          finished_at: Number(row.finished_at),
+          event_count: eventCount,
+          paipu_available: eventCount > 0,
+          results,
+        };
+      });
+      return json({ matches });
+    }
+    const requested = params.get("match");
     let matchKey: string | null = null;
     if (requested !== null && requested.length > 0) {
       if (requested.length > 200) return json({ error: "invalid match key" }, 400);

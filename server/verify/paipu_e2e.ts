@@ -1,8 +1,11 @@
 /** 牌譜（paipu）書き出しの検証。
- *  1. 対局前：終了した半荘がないので GET /paipu は 404 (no_finished_match)。
+ *  1. 対局前：終了した半荘がないので GET /paipu は 404 (no_finished_match)、
+ *     一覧（?list=1）は空で返る。
  *  2. ボット4席で半荘を完走させる（play_http の playMatch を再利用）。
  *  3. 終了後：GET /paipu が NDJSON を返し、ヘッダー／イベント列／
  *     フッター（最終結果）が局面と一致することを確認する。
+ *  4. 終了後の一覧に、その半荘が match_key・イベント件数・結果つきで
+ *     載っていることを確認する（選んで取得するための導線）。
  *
  *  使い方: node verify/paipu_e2e.ts http://127.0.0.1:8787 7
  */
@@ -13,6 +16,13 @@ type Json = Record<string, any>;
 
 async function fetchPaipu(base: string, room: Room): Promise<{ status: number; text: string }> {
   const res = await fetch(`${base}/rooms/${room.room_id}/paipu`, {
+    headers: { authorization: "Bearer " + room.master },
+  });
+  return { status: res.status, text: await res.text() };
+}
+
+async function fetchPaipuList(base: string, room: Room): Promise<{ status: number; text: string }> {
+  const res = await fetch(`${base}/rooms/${room.room_id}/paipu?list=1`, {
     headers: { authorization: "Bearer " + room.master },
   });
   return { status: res.status, text: await res.text() };
@@ -35,6 +45,15 @@ async function main(): Promise<void> {
     "pre-match paipu error should be no_finished_match: " + before.text,
   );
   console.log("pre-match: 404 no_finished_match OK");
+
+  const listBefore = await fetchPaipuList(base, room);
+  assert(listBefore.status === 200, `pre-match paipu list should be 200, got ${listBefore.status}`);
+  const parsedBefore = JSON.parse(listBefore.text) as Json;
+  assert(
+    Array.isArray(parsedBefore.matches) && parsedBefore.matches.length === 0,
+    "pre-match paipu list should be empty: " + listBefore.text,
+  );
+  console.log("pre-match: paipu list empty OK");
 
   const finalState = (await playMatch(base, seed, { roomReuse: { room }, skipExpected: true, keyPrefix: "paipu" })) as Json;
   assert(finalState.phase === "finished", "match should be finished");
@@ -74,6 +93,23 @@ async function main(): Promise<void> {
     `post-match: paipu OK (events=${events.length}, match_key=${header.match_key}, ` +
       `results=${results.map((r) => `${r.display_name}:${r.score}`).join(", ")})`,
   );
+
+  const listAfter = await fetchPaipuList(base, room);
+  assert(listAfter.status === 200, `post-match paipu list should be 200, got ${listAfter.status}`);
+  const parsedAfter = JSON.parse(listAfter.text) as Json;
+  assert(
+    Array.isArray(parsedAfter.matches) && parsedAfter.matches.length >= 1,
+    "post-match paipu list should contain the finished match",
+  );
+  const entry = parsedAfter.matches[0] as Json;
+  assert(entry.match_key === header.match_key, "list entry match_key matches the exported paipu");
+  assert(entry.paipu_available === true, "list entry paipu_available is true");
+  assert(entry.event_count === events.length, "list entry event_count matches exported events");
+  assert(
+    Array.isArray(entry.results) && entry.results.length === 4,
+    "list entry has 4 results",
+  );
+  console.log("post-match: paipu list contains the finished match OK");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -1,0 +1,21 @@
+# Muse雀荘 — Cloudflare Workers + SQLite-backed Durable Objects.
+# One room per DO. Keep the v1 DO migration tag when upgrading.
+name = "muse-jansou"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+[durable_objects]
+bindings = [
+  { name = "ROOMS", class_name = "RoomDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomDO"]
+
+# Secrets are NOT stored in this repository.
+# Production requires the MASTER_TOKEN secret:
+#   npx wrangler secret put MASTER_TOKEN
+# For local development, put DEV_MODE="1" and a local-only
+# MASTER_TOKEN in .dev.vars (gitignored). Never enable DEV_MODE
+# on a public deployment.

@@ -1,0 +1,1 @@
+{"description":"Muse雀荘 Phase 3a：TypeScriptエンジンを Cloudflare Workers + Durable Objects (SQLite) に載せる検証用プロジェクト","devDependencies":{"@cloudflare/workers-types":"^5.20261101.1","typescript":"^5.9.0","wrangler":"^4.45.0"},"name":"muse-jansou-worker","private":true,"scripts":{"dev":"wrangler dev --port 8787 --ip 127.0.0.1","typecheck":"tsc --noEmit"},"type":"module","version":"0.1.0"}

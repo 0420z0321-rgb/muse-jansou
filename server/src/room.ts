@@ -242,6 +242,7 @@ const PAIPU_RETAINED_MATCHES = 5;
 /** Small, completed-only hand snapshots; never an active Game snapshot. */
 const FINISHED_HAND_RETAINED = 128;
 const MAX_NAME_LENGTH = 80;
+const MAX_BIO_LENGTH = 200;
 const MAX_CHEER_LENGTH = 500;
 const CHEER_INTERVAL_MS = 30_000;
 const DEFAULT_CHEER_FLAG_THRESHOLD = 5;
@@ -430,6 +431,14 @@ function validateName(v: unknown, field: string): string | null {
   if (typeof v !== "string" || v.trim().length < 1 ||
       Array.from(v.trim()).length > MAX_NAME_LENGTH || /[\u0000-\u001f]/.test(v)) return `invalid ${field}`;
   return null;
+}
+/** Bio (self-introduction) for the members directory: free text up to
+ *  MAX_BIO_LENGTH characters; newlines are allowed, other control
+ *  characters are not. null clears the bio. */
+function validateBio(v: unknown): boolean {
+  if (v === undefined || v === null) return true;
+  if (typeof v !== "string" || Array.from(v.trim()).length > MAX_BIO_LENGTH) return false;
+  return !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(v);
 }
 function validateAvatarUrl(v: unknown): boolean {
   if (v === undefined || v === null) return true;
@@ -883,7 +892,7 @@ export class RoomDO extends DurableObject {
         );
 
         sql.exec(
-          "CREATE TABLE IF NOT EXISTS credentials (token_hash TEXT PRIMARY KEY, participant_id TEXT NOT NULL UNIQUE, role TEXT NOT NULL, seat INTEGER, display_name TEXT NOT NULL, icon TEXT, avatar_url TEXT, created_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)",
+          "CREATE TABLE IF NOT EXISTS credentials (token_hash TEXT PRIMARY KEY, participant_id TEXT NOT NULL UNIQUE, role TEXT NOT NULL, seat INTEGER, display_name TEXT NOT NULL, icon TEXT, avatar_url TEXT, bio TEXT, created_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)",
         );
         sql.exec(
           "CREATE TABLE IF NOT EXISTS invites (code_hash TEXT PRIMARY KEY, room_id TEXT NOT NULL, role TEXT NOT NULL, seat INTEGER, expires_at INTEGER NOT NULL, max_uses INTEGER NOT NULL, used_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
@@ -906,6 +915,12 @@ export class RoomDO extends DurableObject {
         }
         if (!cheerCols.has("hidden_at")) {
           sql.exec("ALTER TABLE cheers ADD COLUMN hidden_at INTEGER");
+        }
+        // Members directory: self-introduction text on the profile row.
+        const credCols = new Set(sql.exec("PRAGMA table_info(credentials)")
+          .toArray().map((r: Record<string, unknown>) => String(r.name)));
+        if (!credCols.has("bio")) {
+          sql.exec("ALTER TABLE credentials ADD COLUMN bio TEXT");
         }
         sql.exec(
           "CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL, kind TEXT NOT NULL, snapshot TEXT NOT NULL, created_at INTEGER NOT NULL)",
@@ -2232,8 +2247,9 @@ export class RoomDO extends DurableObject {
 
 
   /** Self-service profile update: a joined player or spectator may change
-   * their own display_name / icon / avatar_url. The avatar_url is shown on
-   * the watch page and later carries tiles on the presentation layer.
+   * their own display_name / icon / avatar_url / bio. The avatar_url is shown on
+   * the watch page and later carries tiles on the presentation layer; the
+   * bio is the self-introduction shown in the members directory.
    * Bootstrap and master principals have no editable profile row. */
   private async handleProfile(request: Request, who: Principal): Promise<Response> {
     if ((who.role !== "player" && who.role !== "spectator") ||
@@ -2245,7 +2261,8 @@ export class RoomDO extends DurableObject {
     const hasName = parsed.display_name !== undefined;
     const hasIcon = parsed.icon !== undefined;
     const hasAvatar = parsed.avatar_url !== undefined;
-    if (!hasName && !hasIcon && !hasAvatar) return json({ error: "nothing to update" }, 400);
+    const hasBio = parsed.bio !== undefined;
+    if (!hasName && !hasIcon && !hasAvatar && !hasBio) return json({ error: "nothing to update" }, 400);
     if (hasName) {
       const nameError = validateName(parsed.display_name, "display_name");
       if (nameError) return json({ error: nameError }, 400);
@@ -2257,11 +2274,14 @@ export class RoomDO extends DurableObject {
     if (hasAvatar && !validateAvatarUrl(parsed.avatar_url)) {
       return json({ error: "invalid avatar_url" }, 400);
     }
+    if (hasBio && !validateBio(parsed.bio)) {
+      return json({ error: "invalid bio" }, 400);
+    }
     let status = 200;
     let data: JsonObject = {};
     this.ctx.storage.transactionSync(() => {
       const row = this.ctx.storage.sql.exec(
-        "SELECT display_name, icon, avatar_url FROM credentials WHERE participant_id = ? AND enabled = 1",
+        "SELECT display_name, icon, avatar_url, bio FROM credentials WHERE participant_id = ? AND enabled = 1",
         who.participant_id,
       ).toArray()[0];
       if (!row) { status = 404; data = { error: "profile not found" }; return; }
@@ -2272,9 +2292,12 @@ export class RoomDO extends DurableObject {
       const avatar = hasAvatar
         ? (parsed.avatar_url === null ? null : String(parsed.avatar_url))
         : (row.avatar_url === null || row.avatar_url === undefined ? null : String(row.avatar_url));
+      const bio = hasBio
+        ? (parsed.bio === null ? null : String(parsed.bio).trim())
+        : (row.bio === null || row.bio === undefined ? null : String(row.bio));
       this.ctx.storage.sql.exec(
-        "UPDATE credentials SET display_name = ?, icon = ?, avatar_url = ? WHERE participant_id = ?",
-        name, icon, avatar, who.participant_id,
+        "UPDATE credentials SET display_name = ?, icon = ?, avatar_url = ?, bio = ? WHERE participant_id = ?",
+        name, icon, avatar, bio, who.participant_id,
       );
       this.ctx.storage.sql.exec(
         "UPDATE rotation_queue SET display_name = ?, icon = ? WHERE participant_id = ? AND status = 'promoted'",
@@ -2282,9 +2305,78 @@ export class RoomDO extends DurableObject {
       );
       this.opsLog("profile_updated", { participant_id: who.participant_id });
       this.bumpOccupancyRevisionTx();
-      data = { ok: true, display_name: name, icon, avatar_url: avatar };
+      data = { ok: true, display_name: name, icon, avatar_url: avatar, bio };
     });
     return json(data, status);
+  }
+
+  /**
+   * Members directory for this room (public, same audience as the state
+   * read: any room principal or the watch password). One entry per enabled,
+   * non-bootstrap participant who joined this room, carrying only public
+   * profile fields: display name, icon, avatar, bio, the current seating
+   * situation (seat holder / waiting queue) and the ranking totals.
+   */
+  private handleMembers(): Response {
+    const ranking = this.rankingSummary();
+    const rankOrder = new Map<string, number>();
+    const rankByPid = new Map<string, JsonObject>();
+    ranking.forEach((entry, i) => {
+      rankOrder.set(String(entry.participant_id), i);
+      rankByPid.set(String(entry.participant_id), entry);
+    });
+    const holderSeat = new Map<string, number>();
+    for (const row of this.ctx.storage.sql.exec(
+      "SELECT seat, participant_id FROM rotation_seat_holders",
+    ).toArray()) {
+      holderSeat.set(String(row.participant_id), Number(row.seat));
+    }
+    const waiting = new Set<string>();
+    for (const row of this.ctx.storage.sql.exec(
+      "SELECT participant_id FROM rotation_queue WHERE status = 'waiting' AND participant_id IS NOT NULL",
+    ).toArray()) {
+      waiting.add(String(row.participant_id));
+    }
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT participant_id, role, seat, display_name, icon, avatar_url, bio, created_at FROM credentials " +
+      "WHERE enabled = 1 AND role IN ('player', 'spectator') AND participant_id NOT LIKE 'bootstrap:%' " +
+      "ORDER BY created_at, participant_id",
+    ).toArray();
+    const nullable = (v: unknown): string | null =>
+      v === null || v === undefined ? null : String(v);
+    const members = rows.map((row) => {
+      const pid = String(row.participant_id);
+      const role = String(row.role);
+      const summary = rankByPid.get(pid);
+      const seat = holderSeat.get(pid);
+      return {
+        display_name: String(row.display_name),
+        icon: nullable(row.icon),
+        avatar_url: nullable(row.avatar_url),
+        bio: nullable(row.bio),
+        role,
+        status: seat !== undefined
+          ? { kind: "seated", seat }
+          : (waiting.has(pid) ? { kind: "waiting" } : null),
+        support_seat: role === "spectator" && isSeat(row.seat) ? Number(row.seat) : null,
+        ranking: summary === undefined ? null : {
+          matches: Number(summary.matches), wins: Number(summary.wins),
+          avg_rank: Number(summary.avg_rank), avg_score: Number(summary.avg_score),
+          total_diff: Number(summary.total_diff), best_score: Number(summary.best_score),
+        },
+        rank_order: rankOrder.get(pid) ?? null,
+        created_at: Number(row.created_at),
+      };
+    });
+    // Ranked players first (leaderboard order), then everyone else in join
+    // order; spectators (never ranked) keep join order at the tail.
+    members.sort((a, b) =>
+      (a.rank_order === null ? Number.MAX_SAFE_INTEGER : a.rank_order) -
+      (b.rank_order === null ? Number.MAX_SAFE_INTEGER : b.rank_order) ||
+      a.created_at - b.created_at);
+    return json({
+      members: members.map(({ rank_order: _ro, created_at: _ca, ...pub }) => pub),
+    });
   }
 
   private async handleVacate(request: Request, who: Principal): Promise<Response> {
@@ -2381,6 +2473,15 @@ export class RoomDO extends DurableObject {
         if (rotated.length === 0) promotedCount += this.promoteWaitingTx();
       }
       nextBox.game = newGame(seed, ruleset);
+      // The rematch writes the new game directly instead of going through
+      // commitGame, so the ranking generation must be advanced here —
+      // otherwise the new match reuses the previous match's ranking key
+      // (g<gen>:initial) and recordFinishedMatchTx silently drops its
+      // result as "already recorded".
+      const currentGeneration = Number(this.metaGet("ranking_generation") ?? "0");
+      if (!isInt(currentGeneration) || currentGeneration < 0 ||
+          !Number.isSafeInteger(currentGeneration + 1)) throw new Error("invalid ranking generation");
+      this.metaSet("ranking_generation", String(currentGeneration + 1));
       this.ctx.storage.sql.exec("DELETE FROM leases");
       this.metaSet("game", JSON.stringify(nextBox.game));
       this.appendEvent(nextBox.game, "rematch");
@@ -3101,10 +3202,12 @@ export class RoomDO extends DurableObject {
         // for a chosen support seat without a registered spectator token.
         principal = await this.watchCheerPrincipal(request);
       }
-      if (!principal && (path === "/state" || path === "/watch-events") &&
+      if (!principal && (path === "/state" || path === "/watch-events" || path === "/members") &&
           request.method === "GET") {
         // Human spectator page: a room watch password grants the outer
-        // spectator view (all hands hidden) for state reads only.
+        // spectator view (all hands hidden) for state reads only. The
+        // members directory carries public profile data only, so it shares
+        // the same audience.
         principal = await this.watchPrincipal(request);
       }
       if (!principal) return json({ error: "unauthorized" }, 401);
@@ -3121,6 +3224,7 @@ export class RoomDO extends DurableObject {
       if (path === "/proxy" && request.method === "POST") return await this.handleProxy(request, principal);
       if (path === "/profile" && request.method === "POST") return await this.handleProfile(request, principal);
       if (path === "/state" && request.method === "GET") return await this.handleState(principal);
+      if (path === "/members" && request.method === "GET") return this.handleMembers();
       if (path === "/watch-digest" && request.method === "GET") return await this.handleWatchDigest(request, principal);
       if (path === "/hands/latest" && request.method === "GET") return await this.handleHandsLatest(principal);
       if (path === "/events" && request.method === "GET") return await this.handleEvents(request, principal);

@@ -68,6 +68,9 @@ export const WATCH_HTML = `<!DOCTYPE html>
   #danmaku { position:fixed; left:0; right:0; top:0; height:44%; pointer-events:none; overflow:hidden; z-index:40; }
   #animLayer { position:fixed; inset:0; pointer-events:none; overflow:hidden; z-index:41; }
   .animtile { position:absolute; width:30px; height:40px; transition:transform .5s ease, opacity .5s ease; will-change:transform,opacity; }
+  .animtile.withcarrier { width:44px; height:78px; margin:-38px 0 0 -7px; text-align:center; }
+  .animtile .carrier { display:block; width:40px; height:40px; object-fit:contain; margin:0 auto 2px; animation:carrierHop .26s ease-in-out infinite alternate; }
+  @keyframes carrierHop { from { transform:translateY(0); } to { transform:translateY(-6px); } }
   .fxglow { animation:fxglowA .7s ease; }
   @keyframes fxglowA { 0% { box-shadow:0 0 0 0 rgba(255,217,104,0); } 30% { box-shadow:0 0 18px 6px rgba(255,217,104,.85); } 100% { box-shadow:0 0 0 0 rgba(255,217,104,0); } }
   .fxwin { animation:fxwinA .7s ease 2; }
@@ -147,6 +150,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
 </div>
 <div id="table">
   <h1>🀄 Muse雀荘 観戦</h1>
+  <div style="text-align:right;margin:-6px 0 6px"><a href="/members" style="color:#ffd968;font-size:13.5px">📖 選手名鑑</a>　<a href="/t" style="color:#ffd968;font-size:13.5px">🚪 入口</a></div>
   <div id="danmaku"></div>
   <div id="animLayer"></div>
   <div class="fxbar"><button id="dmToggle">💬 コメントを流す</button> <button id="seButton">🔊 音ON</button></div>
@@ -1179,12 +1183,25 @@ function fxCenter(el) {
   var r = el.getBoundingClientRect();
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
 }
+function fxAvatarUrl(seat) {
+  var st = window.__lastState;
+  var seats = st && st.occupancy && st.occupancy.seats;
+  var s = seats && seats[seat];
+  if (s && typeof s.avatar_url === "string" && s.avatar_url.indexOf("https://") === 0) return s.avatar_url;
+  return null;
+}
+function fxCarrierHtml(seat, tileHtml) {
+  var url = fxAvatarUrl(seat);
+  if (!url) return tileHtml;
+  var safe = url.replace(/["<>]/g, "");
+  return '<img class="carrier" src="' + safe + '" alt="">' + tileHtml;
+}
 function fxFly(fromEl, toEl, html, rotate) {
   var layer = document.getElementById("animLayer");
   var a = fxCenter(fromEl), b = fxCenter(toEl);
   if (!layer || !a || !b) return;
   var d = document.createElement("div");
-  d.className = "animtile";
+  d.className = "animtile" + (html.indexOf("carrier") >= 0 ? " withcarrier" : "");
   d.innerHTML = html;
   d.style.left = (a.x - 15) + "px";
   d.style.top = (a.y - 20) + "px";
@@ -1210,9 +1227,9 @@ function fxOnEvent(ev) {
   var hand = document.getElementById("hand-" + pos);
   var pond = document.getElementById("pond-" + pos);
   if (ev.type === "tile_draw") {
-    fxFly(document.getElementById("corecell"), hand, '<span class="tile back"></span>', false);
+    fxFly(document.getElementById("corecell"), hand, fxCarrierHtml(ev.seat, '<span class="tile back"></span>'), false);
   } else if (ev.type === "discard") {
-    fxFly(hand, pond, tileSpan(ev.tile), !!ev.riichi);
+    fxFly(hand, pond, fxCarrierHtml(ev.seat, tileSpan(ev.tile)), !!ev.riichi);
   } else if (ev.type === "riichi" || ev.type === "call") {
     fxFlash(hand, "fxglow");
   } else if (ev.type === "win") {

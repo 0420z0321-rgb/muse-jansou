@@ -152,6 +152,16 @@ export const WATCH_HTML = `<!DOCTYPE html>
   #cheerSend { padding:7px 14px; border-radius:6px; border:none; background:#e8b13c; color:#222; cursor:pointer; }
   #cheerMsg { font-size:12px; color:#ffd968; min-height:16px; margin-top:4px; }
   #cheerTab { position:fixed; right:12px; bottom:calc(16px + env(safe-area-inset-bottom, 0px)); z-index:45; padding:11px 16px; border-radius:999px; border:2px solid #b98a1e; background:#e8b13c; color:#222; font-weight:bold; font-size:14px; box-shadow:0 4px 14px rgba(0,0,0,.45); cursor:pointer; }
+  #cheerSheet { position:fixed; left:0; right:0; bottom:0; z-index:46; background:#1d5c40; border-top:2px solid #e8b13c; padding:10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); box-shadow:0 -6px 20px rgba(0,0,0,.5); }
+  #cheerSheet .cs-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  #cheerSheet .cs-title { font-weight:bold; font-size:14px; }
+  #csSeats button { margin:2px 4px 2px 0; padding:5px 10px; border-radius:6px; border:1px solid #418262; background:#23543f; color:#f2f2e9; cursor:pointer; }
+  #csSeats button.sel { background:#e8b13c; color:#222; border-color:#e8b13c; font-weight:bold; }
+  #csClose { margin-left:auto; padding:5px 11px; border-radius:6px; border:1px solid #418262; background:#23543f; color:#f2f2e9; cursor:pointer; }
+  #cheerSheet .cs-form { display:flex; gap:6px; }
+  #csText { flex:1; padding:8px; border-radius:6px; border:none; font-size:14px; }
+  #csSend { padding:8px 14px; border-radius:6px; border:none; background:#e8b13c; color:#222; cursor:pointer; font-weight:bold; }
+  #csMsg { font-size:12px; color:#ffd968; min-height:15px; margin-top:4px; }
 </style>
 </head>
 <body>
@@ -210,6 +220,14 @@ export const WATCH_HTML = `<!DOCTYPE html>
     <div id="cheerMsg"></div>
   </div>
   <button id="cheerTab" style="display:none">💬 応援を書く</button>
+  <div id="cheerSheet" style="display:none">
+    <div class="cs-head"><span class="cs-title">📣 応援</span><span id="csSeats"></span><button id="csClose">✕ 閉じる</button></div>
+    <div class="cs-form">
+      <input id="csText" placeholder="応援を書く" maxlength="500">
+      <button id="csSend">送る</button>
+    </div>
+    <div id="csMsg"></div>
+  </div>
   <button id="refresh">更新</button>
   <div id="status"></div>
 </div>
@@ -764,14 +782,15 @@ function updateSupportRow(st) {
     });
   }
 }
-// Fixed "write a cheer" tab: the cheer panel sits below the board and is
-// easy to miss, so a pinned tab follows the reader and jumps to it. The
-// tab hides itself while the panel is actually on screen.
-var cheerTabWanted = false, cheerPanelInView = false;
+// Fixed "write a cheer" tab + bottom sheet: the cheer panel sits below
+// the board and is easy to miss, and scrolling to it hides the game — so
+// the tab opens a floating composer over the page instead; the board
+// stays visible while writing. The full panel below remains for reading.
+var cheerTabWanted = false;
 function cheerTabSync() {
   var tab = document.getElementById("cheerTab");
   if (!tab) return;
-  tab.style.display = (cheerTabWanted && !cheerPanelInView) ? "block" : "none";
+  tab.style.display = cheerTabWanted ? "block" : "none";
 }
 function afterRender(st) {
   window.__lastState = st;
@@ -791,20 +810,68 @@ function afterRender(st) {
 }
 (function() {
   var tab = document.getElementById("cheerTab");
-  var panel = document.getElementById("cheerPanel");
-  if (!tab || !panel) return;
+  var sheet = document.getElementById("cheerSheet");
+  if (!tab || !sheet) return;
+  function csRenderSeats() {
+    var host = document.getElementById("csSeats");
+    var st = window.__lastState;
+    var occ = (st && st.occupancy && st.occupancy.seats) || [];
+    var sup = guestSupport();
+    var html = "";
+    for (var i = 0; i < 4; i++) {
+      var nm = (occ[i] && occ[i].display_name) ? esc(occ[i].display_name) : ("席" + i);
+      html += '<button data-seat="' + i + '"' + (sup === i ? ' class="sel"' : "") + ">" + nm + "</button>";
+    }
+    host.innerHTML = html;
+    var btns = host.querySelectorAll("button");
+    for (var j = 0; j < btns.length; j++) {
+      btns[j].addEventListener("click", function() {
+        localStorage.setItem("watchSupport", this.getAttribute("data-seat"));
+        cheerCursor = 0; cheerItems = []; dmSeeded = false; renderCheers();
+        updateSupportRow(window.__lastState);
+        if (window.__lastState) render(window.__lastState);
+        document.getElementById("csMsg").textContent = "";
+        csRenderSeats();
+        loadCheers();
+      });
+    }
+  }
+  function csPost() {
+    var text = document.getElementById("csText").value.trim();
+    var msg = document.getElementById("csMsg");
+    if (guestSupport() === null) { msg.textContent = "先に応援席を選んでください"; return; }
+    if (!text) { msg.textContent = "コメントが空です"; return; }
+    var h = cheerHeaders(); h["Content-Type"] = "application/json";
+    fetch("/rooms/" + roomId + "/cheers", {
+      method: "POST", headers: h,
+      body: JSON.stringify({ text: text, client_nonce: watchClientId() + "-" + Date.now() })
+    }).then(function(res) {
+      if (res.ok) {
+        document.getElementById("csText").value = "";
+        msg.textContent = "";
+        loadCheers();
+      } else if (res.status === 429) {
+        msg.textContent = "連投制限中です。30秒あけてください";
+      } else {
+        msg.textContent = "送れませんでした（" + res.status + "）";
+      }
+    }).catch(function() { msg.textContent = "通信エラーです"; });
+  }
   tab.addEventListener("click", function() {
-    panel.scrollIntoView({ behavior: "smooth", block: "center" });
-    if (guestSupport() !== null) {
-      setTimeout(function() { document.getElementById("cheerText").focus({ preventScroll: true }); }, 500);
+    var open = sheet.style.display !== "block";
+    sheet.style.display = open ? "block" : "none";
+    if (open) {
+      csRenderSeats();
+      if (guestSupport() !== null) document.getElementById("csText").focus({ preventScroll: true });
     }
   });
-  if ("IntersectionObserver" in window) {
-    new IntersectionObserver(function(es) {
-      cheerPanelInView = !!(es[0] && es[0].isIntersecting);
-      cheerTabSync();
-    }, { threshold: 0.12 }).observe(panel);
-  }
+  document.getElementById("csClose").addEventListener("click", function() {
+    sheet.style.display = "none";
+  });
+  document.getElementById("csSend").addEventListener("click", csPost);
+  document.getElementById("csText").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") csPost();
+  });
 })();
 document.getElementById("cheerName").addEventListener("change", function() {
   localStorage.setItem("watchName", this.value.trim());

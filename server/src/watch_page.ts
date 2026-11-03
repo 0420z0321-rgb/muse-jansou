@@ -620,11 +620,36 @@ function dmSpawn(text, name, seat) {
   var anim = el.animate([{ transform: "translateX(0)" }, { transform: "translateX(-" + (vw + w + 30) + "px)" }], { duration: dur, easing: "linear" });
   anim.onfinish = function() { el.remove(); };
 }
-function dmFlowNew(list, seatHint) {
+function dmFlowNew(list, seatHint, isLoop) {
+  if (!isLoop) {
+    dmLastFreshAt = Date.now();
+    list.forEach(function(c) {
+      if (!c || typeof c.text !== "string") return;
+      var dup = dmLoopPool.some(function(p) {
+        return (typeof c.seq === "number" && p.seq === c.seq) ||
+          (p.text === c.text && p.from === c.from && p.target_seat === c.target_seat);
+      });
+      if (!dup) dmLoopPool.push(c);
+    });
+    while (dmLoopPool.length > 10) dmLoopPool.shift();
+  }
   list.forEach(function(c, i) {
     setTimeout(function() { dmSpawn(c.text, c.from || "", (typeof c.target_seat === "number" ? c.target_seat : seatHint)); }, i * 650);
   });
 }
+// Loop replay: when no fresh cheers arrive for a while, the recent ones
+// flow again in a slow cycle (rotating the starting point each round).
+var dmLoopPool = [], dmLastFreshAt = 0, dmLoopOffset = 0;
+setInterval(function() {
+  if (!dmEnabled() || document.hidden) return;
+  var tbl = document.getElementById("table");
+  if (!tbl || tbl.style.display !== "block") return;
+  if (!dmLoopPool.length) return;
+  if (Date.now() - dmLastFreshAt < 12000) return;
+  var n = dmLoopPool.length, off = dmLoopOffset % n;
+  dmLoopOffset++;
+  dmFlowNew(dmLoopPool.slice(off).concat(dmLoopPool.slice(0, off)), null, true);
+}, 18000);
 function dmPollToken() {
   if (dmTokDead) return;
   if ((sessionStorage.getItem("watchMode") || "pw") !== "token") return;

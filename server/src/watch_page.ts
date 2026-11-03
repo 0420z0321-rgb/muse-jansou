@@ -129,6 +129,8 @@ export const WATCH_HTML = `<!DOCTYPE html>
   .tile svg { display:block; width:100%; height:100%; }
   .pondbox .tile { width:21px; height:28px; }
   .handstrip .tile { width:26px; height:35px; }
+  .handstrip .tile.drawn { margin-left:10px; }
+  .handstrip.v .tile.drawn { margin-left:0; margin-top:10px; }
   #meta .tile { width:19px; height:26px; }
   .melds .tile { width:22px; height:30px; }
   .meldgroup { margin-right:6px; white-space:nowrap; }
@@ -472,8 +474,15 @@ function render(st) {
       var note = "";
       if (st.viewer && st.viewer.watch_open_hands) note = "手牌（公開中）";
       else if (st.viewer && st.viewer.role === "spectator" && st.viewer.seat === s) note = "応援席の手牌（あなただけに見えています）";
-      var spans = hand.map(function(t){ return tileSpan(t); });
-      if (pos === "top" || pos === "right") spans.reverse();
+      var tiles = hand.slice();
+      if (pos === "top" || pos === "right") tiles.reverse();
+      // The just-drawn tile sits apart at the end of the strip (like real
+      // clients), instead of being sorted into the hand. The server only
+      // exposes last_drawn to viewers who may see that seat's hand.
+      var drawnTile = (st.phase === "discard" && st.turn === s && typeof st.last_drawn === "number") ? st.last_drawn : null;
+      var di = drawnTile === null ? -1 : tiles.indexOf(drawnTile);
+      if (di >= 0) { tiles.splice(di, 1); tiles.push(drawnTile); }
+      var spans = tiles.map(function(t, i){ return tileSpan(t, (di >= 0 && i === tiles.length - 1) ? "drawn" : undefined); });
       handHtml = '<div class="htiles open">' + spans.join("") + "</div>" +
         (note ? '<div class="seatnote">' + note + "</div>" : "");
     }

@@ -80,6 +80,24 @@ export const WATCH_HTML = `<!DOCTYPE html>
   .fxbar { text-align:center; margin:2px 0 4px; }
   .fxbar button { margin:0 3px; padding:5px 12px; border-radius:6px; border:1px solid #418262; background:#23543f; color:#f2f2e9; cursor:pointer; font-size:13px; }
   .fxbar button.sel { background:#e8b13c; color:#222; border-color:#e8b13c; font-weight:bold; }
+  .fxbar button.gold { background:#e8b13c; color:#222; border-color:#e8b13c; font-weight:bold; }
+  #membersOverlay { position:fixed; inset:0; background:rgba(4,18,12,.62); z-index:60; display:flex; justify-content:flex-end; }
+  #membersPanel { background:#123524; color:#f2ead8; width:min(430px,94vw); height:100%; overflow-y:auto; box-shadow:-6px 0 18px rgba(0,0,0,.45); padding:14px 14px 22px; box-sizing:border-box; }
+  .mp-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
+  .mp-title { font-size:18px; font-weight:bold; color:#ffd968; }
+  #membersClose { padding:6px 12px; border-radius:6px; border:1px solid #418262; background:#23543f; color:#f2f2e9; cursor:pointer; font-size:13px; }
+  .mb-member { display:flex; gap:12px; background:#1a4630; border:1px solid #ffd96855; border-radius:14px; padding:12px 13px; margin:10px 0; }
+  .mb-avatar { flex:0 0 auto; width:54px; height:54px; border-radius:50%; background:#0f2f1f; border:2px solid #ffd96888; display:flex; align-items:center; justify-content:center; font-size:26px; overflow:hidden; }
+  .mb-avatar img { width:100%; height:100%; object-fit:cover; display:block; }
+  .mb-body { flex:1 1 auto; min-width:0; }
+  .mb-name { font-size:16px; font-weight:bold; overflow-wrap:anywhere; }
+  .mb-chip { display:inline-block; background:#0f2f1f; border:1px solid #ffffff2e; border-radius:999px; padding:1px 9px; font-size:12px; margin-left:7px; vertical-align:2px; font-weight:normal; }
+  .mb-chip.seated { border-color:#ffd968; color:#ffd968; }
+  .mb-rank { font-size:13px; opacity:.92; margin-top:2px; }
+  .mb-bio { font-size:14px; line-height:1.65; margin-top:6px; white-space:pre-line; overflow-wrap:anywhere; }
+  .mb-empty { opacity:.8; font-size:14px; padding:10px 2px; }
+  .mb-foot { font-size:12.5px; opacity:.85; margin-top:12px; }
+  .mb-foot a { color:#ffd968; }
   .avatar img { width:100%; height:100%; object-fit:cover; border-radius:50%; display:block; }
   .occ-avatar { width:22px; height:22px; border-radius:50%; object-fit:cover; vertical-align:-6px; margin-right:5px; }
   .htiles { display:flex; gap:2px; align-items:center; }
@@ -153,7 +171,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
   <div style="text-align:right;margin:-6px 0 6px"><a href="/members" style="color:#ffd968;font-size:13.5px">📖 選手名鑑</a>　<a href="/t" style="color:#ffd968;font-size:13.5px">🚪 入口</a></div>
   <div id="danmaku"></div>
   <div id="animLayer"></div>
-  <div class="fxbar"><button id="dmToggle">💬 コメントを流す</button> <button id="seButton">🔊 音ON</button></div>
+  <div class="fxbar"><button id="dmToggle">💬 コメントを流す</button> <button id="seButton">🔊 音ON</button> <button id="membersBtn" class="gold">📖 選手名鑑</button></div>
   <div id="meta"></div>
   <div id="occupancy" aria-label="参加・観戦状況" aria-live="polite" style="display:none"></div>
   <div id="ranking" aria-label="ランキング" aria-live="polite" style="display:none"></div>
@@ -192,6 +210,13 @@ export const WATCH_HTML = `<!DOCTYPE html>
   </div>
   <button id="refresh">更新</button>
   <div id="status"></div>
+</div>
+<div id="membersOverlay" style="display:none">
+  <div id="membersPanel">
+    <div class="mp-head"><span class="mp-title">📖 選手名鑑（この卓）</span><button id="membersClose">✕ 閉じる</button></div>
+    <div id="membersList"><div class="mb-empty">読み込み中…</div></div>
+    <div class="mb-foot">両卓まとめて見る → <a href="/members">選手名鑑ページ</a></div>
+  </div>
 </div>
 <script>
 var roomId = location.pathname.split("/")[2];
@@ -402,13 +427,14 @@ function render(st) {
   document.getElementById("meta").innerHTML =
     esc(round) + " " + honba + "本場 / 供託 " + (st.kyotaku ?? 0) + " / 山 残り" + (st.wall_count ?? "?") + "枚 / ドラ表示 " + (dora || "―");
   var dealer = st.dealer ?? 0;
+  var pivot = viewPivot(st);
   // Table layout: the four ponds form a square in the middle (no center
   // display; round info lives in the meta line). Each player's hand sits
   // outside its pond as one neat row (a column for the side players),
   // tiles facing that player, like a real table.
   var posByRel = ["bottom", "right", "top", "left"];
   for (var s = 0; s < 4; s++) {
-    var pos = posByRel[(s - dealer + 4) % 4];
+    var pos = posByRel[(s - pivot + 4) % 4];
     var isTurn = (st.turn === s && st.match_status !== "finished");
     var strip = document.getElementById("hand-" + pos);
     strip.className = "handstrip " + pos + ((pos === "left" || pos === "right") ? " v" : "") + (isTurn ? " turn" : "");
@@ -473,7 +499,7 @@ function render(st) {
     pondEl.innerHTML = chunked;
   }
   var sideFor = function(rel) {
-    var seat = (dealer + rel) % 4;
+    var seat = (pivot + rel) % 4;
     var turnCls = (st.turn === seat && st.match_status !== "finished") ? " turn" : "";
     return '<div class="core-side' + turnCls + '">' + windName(seat, dealer) + '<br><span class="sc">' +
       ((st.scores || [])[seat] ?? "?") + "</span></div>";
@@ -637,6 +663,15 @@ function guestSupport() {
   var v = localStorage.getItem("watchSupport");
   return (v === null || v === "") ? null : Number(v);
 }
+// The seat the table is viewed from: the chosen support seat when there is
+// one (the board rotates so that seat sits at the bottom), else the
+// spectator credential's own support seat, else the dealer as before.
+function viewPivot(st) {
+  var sup = guestSupport();
+  if (sup !== null && sup >= 0 && sup <= 3) return sup;
+  if (st && st.viewer && st.viewer.role === "spectator" && typeof st.viewer.seat === "number") return st.viewer.seat;
+  return (st && typeof st.dealer === "number") ? st.dealer : 0;
+}
 function cheerHeaders() {
   var h = { "X-Watch-Password": sessionStorage.getItem("watchSecret") || "",
             "X-Watch-Client": watchClientId() };
@@ -684,6 +719,7 @@ function updateSupportRow(st) {
   var occ = (st && st.occupancy && st.occupancy.seats) || [];
   var sup = guestSupport();
   var html = '<span style="font-size:13px">応援席：</span>';
+  html += '<span class="note">選ぶと視点もその席に移ります</span>';
   for (var i = 0; i < 4; i++) {
     var nm = (occ[i] && occ[i].display_name) ? esc(occ[i].display_name) : ("席" + i);
     html += '<button data-seat="' + i + '"' + (sup === i ? ' class="sel"' : "") + ">" + nm + "</button>";
@@ -696,6 +732,7 @@ function updateSupportRow(st) {
       cheerCursor = 0; cheerItems = []; dmSeeded = false; renderCheers();
       document.getElementById("cheerMsg").textContent = "";
       updateSupportRow(window.__lastState);
+      if (window.__lastState) render(window.__lastState);
       loadCheers();
     });
   }
@@ -1175,8 +1212,8 @@ document.getElementById("cheerText").addEventListener("keydown", function(e) {
 // ---- watch FX: tile motion driven by the same events ----
 var fxInited = false;
 function fxSeatPos(seat) {
-  var dealer = (window.__lastState && typeof window.__lastState.dealer === "number") ? window.__lastState.dealer : 0;
-  return ["bottom", "right", "top", "left"][(seat - dealer + 4) % 4];
+  var pivot = viewPivot(window.__lastState || null);
+  return ["bottom", "right", "top", "left"][(seat - pivot + 4) % 4];
 }
 function fxCenter(el) {
   if (!el) return null;
@@ -1254,6 +1291,112 @@ function maybeInitWatchFX() {
     window.JansouEvents.subscribe(fxOnEvent);
   } catch (e) { console.log(e); }
 }
+
+// ---- members overlay: this room's registered players, without leaving
+// the watch page. Data comes from GET /rooms/{id}/members, readable with
+// the same credentials as the state read (watch password or a room token).
+// Participant-supplied fields are rendered with textContent only.
+var membersOpen = false;
+function membersHeaders() {
+  var mode = sessionStorage.getItem("watchMode") || "pw";
+  var secret = sessionStorage.getItem("watchSecret") || "";
+  return mode === "token" ? { "Authorization": "Bearer " + secret } : { "X-Watch-Password": secret };
+}
+function mbAvatar(m) {
+  var av = document.createElement("div");
+  av.className = "mb-avatar";
+  if (typeof m.avatar_url === "string" && m.avatar_url.indexOf("https://") === 0) {
+    var img = document.createElement("img");
+    img.src = m.avatar_url; img.alt = "";
+    av.appendChild(img);
+  } else if (typeof m.icon === "string" && m.icon) {
+    av.textContent = m.icon;
+  } else {
+    var name = typeof m.display_name === "string" && m.display_name ? m.display_name : "?";
+    av.textContent = Array.from(name)[0] || "?";
+  }
+  return av;
+}
+function renderMembers(list) {
+  var host = document.getElementById("membersList");
+  host.textContent = "";
+  if (!list.length) {
+    var empty = document.createElement("div");
+    empty.className = "mb-empty";
+    empty.textContent = "まだ登録がありません";
+    host.appendChild(empty);
+    return;
+  }
+  list.forEach(function(m) {
+    var card = document.createElement("div");
+    card.className = "mb-member";
+    card.appendChild(mbAvatar(m));
+    var body = document.createElement("div");
+    body.className = "mb-body";
+    var nameRow = document.createElement("div");
+    nameRow.className = "mb-name";
+    nameRow.appendChild(document.createTextNode(
+      typeof m.display_name === "string" && m.display_name ? m.display_name : "参加者"));
+    var chips = [];
+    if (m.status && m.status.kind === "seated") chips.push({ t: "着席中・席" + m.status.seat, gold: true });
+    else if (m.status && m.status.kind === "waiting") chips.push({ t: "待ち列に並んでいます", gold: false });
+    if (m.role === "spectator") chips.push({ t: "観戦" + (typeof m.support_seat === "number" ? "・応援席" + m.support_seat : ""), gold: false });
+    chips.forEach(function(c) {
+      var chip = document.createElement("span");
+      chip.className = "mb-chip" + (c.gold ? " seated" : "");
+      chip.textContent = c.t;
+      nameRow.appendChild(chip);
+    });
+    body.appendChild(nameRow);
+    if (m.role !== "spectator") {
+      var rank = document.createElement("div");
+      rank.className = "mb-rank";
+      rank.textContent = m.ranking
+        ? m.ranking.matches + "対局 ／ 平均順位 " + m.ranking.avg_rank + " ／ 最高 " + m.ranking.best_score + "点"
+        : "まだ対局なし";
+      body.appendChild(rank);
+    }
+    if (typeof m.bio === "string" && m.bio) {
+      var bio = document.createElement("div");
+      bio.className = "mb-bio";
+      bio.textContent = m.bio;
+      body.appendChild(bio);
+    }
+    card.appendChild(body);
+    host.appendChild(card);
+  });
+}
+function loadMembers() {
+  fetch("/rooms/" + roomId + "/members", { headers: membersHeaders() })
+    .then(function(res) { return res.ok ? res.json() : null; })
+    .then(function(d) {
+      var host = document.getElementById("membersList");
+      if (!d || !Array.isArray(d.members)) {
+        host.textContent = "";
+        var e = document.createElement("div");
+        e.className = "mb-empty";
+        e.textContent = "名鑑を取得できませんでした";
+        host.appendChild(e);
+        return;
+      }
+      var panel = document.getElementById("membersPanel");
+      var st = panel.scrollTop;
+      renderMembers(d.members);
+      panel.scrollTop = st;
+    })
+    .catch(function() {});
+}
+function setMembersOpen(open) {
+  membersOpen = open;
+  document.getElementById("membersOverlay").style.display = open ? "flex" : "none";
+  if (open) loadMembers();
+}
+document.getElementById("membersBtn").addEventListener("click", function() { setMembersOpen(true); });
+document.getElementById("membersClose").addEventListener("click", function() { setMembersOpen(false); });
+document.getElementById("membersOverlay").addEventListener("click", function(e) { if (e.target === this) setMembersOpen(false); });
+setInterval(function() {
+  if (membersOpen && document.getElementById("table").style.display === "block") loadMembers();
+}, 5000);
 </script>
 </body>
 </html>

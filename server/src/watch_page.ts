@@ -151,6 +151,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
   #cheerText { flex:1; padding:7px; border-radius:6px; border:none; font-size:14px; }
   #cheerSend { padding:7px 14px; border-radius:6px; border:none; background:#e8b13c; color:#222; cursor:pointer; }
   #cheerMsg { font-size:12px; color:#ffd968; min-height:16px; margin-top:4px; }
+  #cheerTab { position:fixed; right:12px; bottom:calc(16px + env(safe-area-inset-bottom, 0px)); z-index:45; padding:11px 16px; border-radius:999px; border:2px solid #b98a1e; background:#e8b13c; color:#222; font-weight:bold; font-size:14px; box-shadow:0 4px 14px rgba(0,0,0,.45); cursor:pointer; }
 </style>
 </head>
 <body>
@@ -208,6 +209,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
     <input id="cheerName" placeholder="名前（任意）" maxlength="20">
     <div id="cheerMsg"></div>
   </div>
+  <button id="cheerTab" style="display:none">💬 応援を書く</button>
   <button id="refresh">更新</button>
   <div id="status"></div>
 </div>
@@ -762,12 +764,22 @@ function updateSupportRow(st) {
     });
   }
 }
+// Fixed "write a cheer" tab: the cheer panel sits below the board and is
+// easy to miss, so a pinned tab follows the reader and jumps to it. The
+// tab hides itself while the panel is actually on screen.
+var cheerTabWanted = false, cheerPanelInView = false;
+function cheerTabSync() {
+  var tab = document.getElementById("cheerTab");
+  if (!tab) return;
+  tab.style.display = (cheerTabWanted && !cheerPanelInView) ? "block" : "none";
+}
 function afterRender(st) {
   window.__lastState = st;
   var mode = sessionStorage.getItem("watchMode") || "pw";
   var panel = document.getElementById("cheerPanel");
-  if (mode !== "pw") { panel.style.display = "none"; return; }
+  if (mode !== "pw") { panel.style.display = "none"; cheerTabWanted = false; cheerTabSync(); return; }
   panel.style.display = "block";
+  cheerTabWanted = true; cheerTabSync();
   var sup = guestSupport();
   if (sup !== cheerSupportSeen) { cheerSupportSeen = sup; cheerCursor = 0; cheerItems = []; dmSeeded = false; renderCheers(); }
   else if (!cheerItems.length) { renderCheers(); }
@@ -777,6 +789,23 @@ function afterRender(st) {
   }
   loadCheers();
 }
+(function() {
+  var tab = document.getElementById("cheerTab");
+  var panel = document.getElementById("cheerPanel");
+  if (!tab || !panel) return;
+  tab.addEventListener("click", function() {
+    panel.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (guestSupport() !== null) {
+      setTimeout(function() { document.getElementById("cheerText").focus({ preventScroll: true }); }, 500);
+    }
+  });
+  if ("IntersectionObserver" in window) {
+    new IntersectionObserver(function(es) {
+      cheerPanelInView = !!(es[0] && es[0].isIntersecting);
+      cheerTabSync();
+    }, { threshold: 0.12 }).observe(panel);
+  }
+})();
 document.getElementById("cheerName").addEventListener("change", function() {
   localStorage.setItem("watchName", this.value.trim());
 });

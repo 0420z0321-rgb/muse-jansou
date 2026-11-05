@@ -109,6 +109,8 @@ export interface Ruleset {
   /** Replace one ordinary five per suit with a distinct red physical tile. */
   aka: boolean;
   match_length: "east" | "south";
+  /** Owner opt-in: this table accepts seats held by humans (default off). */
+  allow_human_players: boolean;
 }
 
 export interface ClockState {
@@ -280,6 +282,7 @@ export function normRuleset(r?: Partial<Ruleset> | null): Ruleset {
     clock: { enabled: Boolean(clockIn.enabled), preset },
     aka: src.aka === true,
     match_length: src.match_length === "east" ? "east" : "south",
+    allow_human_players: src.allow_human_players === true,
   };
 }
 

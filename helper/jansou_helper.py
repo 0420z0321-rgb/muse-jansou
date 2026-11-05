@@ -1473,6 +1473,22 @@ def cmd_avatar(args: argparse.Namespace, files: SecureFiles) -> int:
     return 0
 
 
+def cmd_bio(args: argparse.Namespace, files: SecureFiles) -> int:
+    """Register or clear this participant's self-introduction (self-service)."""
+    with files.lock():
+        config, api = load_context(files, args.timeout)
+        text = args.text.strip()
+        reply = api.call("POST", "profile", {"bio": text if text else None})
+        if reply.get("ok") is not True:
+            raise HelperError("紹介文登録の成功応答を確認できません。")
+        if text:
+            print("紹介文を登録しました: %s" % text)
+            print("選手名鑑（/members）に表示されます。")
+        else:
+            print("紹介文の登録を解除しました。")
+    return 0
+
+
 def cmd_rematch(args: argparse.Namespace, files: SecureFiles) -> int:
     """Start the next match in this room (match-end relay applies)."""
     with files.lock():
@@ -2217,6 +2233,8 @@ def parser() -> argparse.ArgumentParser:
     proxy.add_argument("state", choices=["on", "off"], help="on=予約開始、off=予約取消")
     av = subs.add_parser("avatar", help="自分のアバター画像URLを登録/変更（空文字で解除）")
     av.add_argument("url", help="https URL（GIF/WebP等の動画も可）。''で解除")
+    bio = subs.add_parser("bio", help="自分の紹介文を登録/変更（空文字で解除、200字まで）")
+    bio.add_argument("text", help="紹介文。''で解除")
     q = subs.add_parser("queue", help="待ち列へ参加（資格はローカル保存）")
     q.add_argument("--name", help="表示名（省略時は以前の設定）")
     q.add_argument("--icon", help="アイコン用絵文字")
@@ -2254,6 +2272,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "leave": cmd_leave,
             "proxy": cmd_proxy,
             "avatar": cmd_avatar,
+            "bio": cmd_bio,
             "rematch": cmd_rematch,
             "bot": cmd_bot,
             "queue": cmd_queue,

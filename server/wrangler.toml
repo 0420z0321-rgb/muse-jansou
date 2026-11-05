@@ -1,21 +1,28 @@
-# Muse雀荘 — Cloudflare Workers + SQLite-backed Durable Objects.
-# One room per DO. Keep the v1 DO migration tag when upgrading.
+# Muse雀荘 Phase 4 — Cloudflare Workers + SQLite-backed Durable Objects.
+# One room per DO. New Phase 4 SQLite tables are created/upgraded in RoomDO's
+# constructor; keep the existing v1 DO migration tag when upgrading from 3b.
 name = "muse-jansou"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
 
 [durable_objects]
 bindings = [
-  { name = "ROOMS", class_name = "RoomDO" }
+  { name = "ROOMS", class_name = "RoomDO" },
+  { name = "HUMAN_CHIP_VAULT", class_name = "HumanChipVault" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RoomDO"]
 
-# Secrets are NOT stored in this repository.
-# Production requires the MASTER_TOKEN secret:
-#   npx wrangler secret put MASTER_TOKEN
-# For local development, put DEV_MODE="1" and a local-only
-# MASTER_TOKEN in .dev.vars (gitignored). Never enable DEV_MODE
-# on a public deployment.
+[[migrations]]
+tag = "lab-c-human-v1"
+new_sqlite_classes = ["HumanChipVault"]
+
+# In local .dev.vars only:
+# DEV_MODE="1"
+# MASTER_TOKEN="optional-local-test-secret"
+# Never set DEV_MODE="1" on a public deployment.
+# In production the Worker refuses POST /rooms if MASTER_TOKEN is absent.
+# Set the production secret using: npx wrangler secret put MASTER_TOKEN
+# No D1 binding is required: credentials/invites/spectators live in each RoomDO.

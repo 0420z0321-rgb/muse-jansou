@@ -17,6 +17,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   applyAction,
   currentDecisions,
+  doraIndicators,
   newGame,
   publicState,
   setNowMs,
@@ -25,6 +26,21 @@ import {
   type Game,
   type Ruleset,
 } from "../../ts/game.ts";
+import {
+  BindingService,
+  ExecutionStore,
+  HumanChipDriver,
+  createMuseExecutionHost,
+  handleBindingRequest,
+  vaultLoader,
+  type ExecutionEvent as HcxEvent,
+  type ExecutionVaultNamespace,
+  type LegalAction as HcxLegalAction,
+  type Principal as HcxPrincipal,
+  type RoomAccess as HcxRoomAccess,
+  type Seat as HcxSeat,
+} from "./human_chip_execution/index.js";
+import type { StoragePort } from "./lab_c/vault.js";
 
 const LEASE_TTL_MS = 180_000;
 const MAX_BODY_BYTES = 64 * 1024;
@@ -376,6 +392,16 @@ function viewState(raw: unknown, viewer: Viewer, policy: RoomPolicy): JsonObject
   if (raw.pending !== undefined) out.pending = cleanPending(raw.pending);
   if (raw.dora !== undefined) out.dora = cleanDora(raw.dora, finished);
   if (raw.clock !== undefined) out.clock = cleanClock(raw.clock, viewer);
+  if (isObject(raw.ruleset)) {
+    // Only the display-relevant ruleset facts cross to clients. In
+    // particular allow_human_players tells the human play page (and the
+    // tables entrance) whether this table opens seats to humans.
+    out.ruleset = {
+      allow_human_players: raw.ruleset.allow_human_players === true,
+      aka: raw.ruleset.aka === true,
+      match_length: raw.ruleset.match_length === "east" ? "east" : "south",
+    };
+  }
   if (isObject(raw.round)) out.round = copySafeFields(raw.round, ["wind", "number", "label", "honba"]);
   if (Array.isArray(raw.riichi)) {
     out.riichi = raw.riichi.map(v => isObject(v) ?
@@ -870,10 +896,15 @@ export class RoomDO extends DurableObject {
   private lastAlarmCheckAt = 0;
   private alarmStalledKey: string | null = null;
   private readonly devMode: boolean;
+  private readonly vaultNs: ExecutionVaultNamespace | null;
+  private hcxStore: ExecutionStore | null = null;
+  private hcxBindings: BindingService | null = null;
+  private hcxDriver: HumanChipDriver | null = null;
 
-  constructor(ctx: DurableObjectState, env: { DEV_MODE?: string }) {
+  constructor(ctx: DurableObjectState, env: { DEV_MODE?: string; HUMAN_CHIP_VAULT?: unknown }) {
     super(ctx, env as never);
     this.devMode = env.DEV_MODE === "1";
+    this.vaultNs = (env.HUMAN_CHIP_VAULT ?? null) as ExecutionVaultNamespace | null;
 
     ctx.blockConcurrencyWhile(async () => {
       this.ctx.storage.transactionSync(() => {
@@ -1309,6 +1340,18 @@ export class RoomDO extends DurableObject {
 
   /** Commit a proposed Game atomically, then change the memory cache. */
   private commitGame(next: Game, options: PersistOptions): void {
+    this.ctx.storage.transactionSync(() => this.commitGameTx(next, options));
+    this.game = next;
+    this.savedRevision = next.revision;
+  }
+
+  /**
+   * Transaction body of commitGame. Callers already inside a transactionSync
+   * (the human-chip driver) use this directly so the game commit, the
+   * execution bookkeeping and the paipu record land in ONE transaction.
+   * The memory cache is NOT touched here; the caller publishes afterwards.
+   */
+  private commitGameTx(next: Game, options: PersistOptions): void {
     const previous = this.game;
     // Rotation grace: a seat whose holder just changed carries a one-time
     // flag; the first deadline armed for that seat is extended by a free
@@ -1327,48 +1370,44 @@ export class RoomDO extends DurableObject {
     }
     const snapshot = JSON.stringify(next);
     const snapshotBytes = new TextEncoder().encode(snapshot).byteLength;
-    this.ctx.storage.transactionSync(() => {
-      this.metaSet("game", snapshot);
-      if (this.matchBegunForOccupancy(previous) !== this.matchBegunForOccupancy(next)) {
-        this.bumpOccupancyRevisionTx();
-      }
-      if (previous?.phase === "finished" && next.phase !== "finished") {
-        const currentGeneration = Number(this.metaGet("ranking_generation") ?? "0");
-        if (!isInt(currentGeneration) || currentGeneration < 0 ||
-            !Number.isSafeInteger(currentGeneration + 1)) throw new Error("invalid ranking generation");
-        this.metaSet("ranking_generation", String(currentGeneration + 1));
-      }
-      if (options.action) {
-        const a = options.action;
-        // Only the acting seat's lease is consumed here.
+    this.metaSet("game", snapshot);
+    if (this.matchBegunForOccupancy(previous) !== this.matchBegunForOccupancy(next)) {
+      this.bumpOccupancyRevisionTx();
+    }
+    if (previous?.phase === "finished" && next.phase !== "finished") {
+      const currentGeneration = Number(this.metaGet("ranking_generation") ?? "0");
+      if (!isInt(currentGeneration) || currentGeneration < 0 ||
+          !Number.isSafeInteger(currentGeneration + 1)) throw new Error("invalid ranking generation");
+      this.metaSet("ranking_generation", String(currentGeneration + 1));
+    }
+    if (options.action) {
+      const a = options.action;
+      // Only the acting seat's lease is consumed here.
+      this.ctx.storage.sql.exec(
+        "DELETE FROM leases WHERE decision_id = ? AND seat = ?",
+        a.decisionId, a.consumedSeat,
+      );
+      if (a.idemKey !== null && a.requestHash !== null) {
         this.ctx.storage.sql.exec(
-          "DELETE FROM leases WHERE decision_id = ? AND seat = ?",
-          a.decisionId, a.consumedSeat,
+          "INSERT INTO idempotency (key, request_hash, result, status_code, created_at) VALUES (?, ?, ?, ?, ?)",
+          a.idemKey, a.requestHash, JSON.stringify(a.response), a.statusCode, Date.now(),
         );
-        if (a.idemKey !== null && a.requestHash !== null) {
-          this.ctx.storage.sql.exec(
-            "INSERT INTO idempotency (key, request_hash, result, status_code, created_at) VALUES (?, ?, ?, ?, ?)",
-            a.idemKey, a.requestHash, JSON.stringify(a.response), a.statusCode, Date.now(),
-          );
-        }
       }
-      // If the phase/decision advanced, other leases are no longer valid.
-      if (typeof next.decision_id === "string") {
-        this.ctx.storage.sql.exec(
-          "DELETE FROM leases WHERE decision_id <> ?", next.decision_id,
-        );
-      } else {
-        this.ctx.storage.sql.exec("DELETE FROM leases");
-      }
-      this.opsLog(options.logKind, options.logPayload);
-      this.appendEvent(next, options.logKind);
-      if (previous?.phase !== "finished" && next.phase === "finished") {
-        this.recordFinishedMatchTx(next);
-        this.logCompletionMetrics(snapshotBytes);
-      }
-    });
-    this.game = next;
-    this.savedRevision = next.revision;
+    }
+    // If the phase/decision advanced, other leases are no longer valid.
+    if (typeof next.decision_id === "string") {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM leases WHERE decision_id <> ?", next.decision_id,
+      );
+    } else {
+      this.ctx.storage.sql.exec("DELETE FROM leases");
+    }
+    this.opsLog(options.logKind, options.logPayload);
+    this.appendEvent(next, options.logKind);
+    if (previous?.phase !== "finished" && next.phase === "finished") {
+      this.recordFinishedMatchTx(next);
+      this.logCompletionMetrics(snapshotBytes);
+    }
   }
 
   /**
@@ -1416,6 +1455,215 @@ export class RoomDO extends DurableObject {
     });
   }
 
+  // ---- Human chip execution connection (laboratory execution link) ----
+  // Active only on tables whose ruleset opens human seats, and only for
+  // seats currently held by a human participant. Muse tables and Muse-held
+  // seats never touch this path. A bound deposited program proposes moves;
+  // the server intersects the proposal with the real legal actions and, on
+  // any failure, records it and leaves the seat to the existing clock —
+  // never substituting another move.
+
+  private hcxHumanTable(): boolean {
+    return this.game !== null && this.game.ruleset.allow_human_players === true;
+  }
+
+  private hcxHolderRow(seat: number): { participant_id: string; assigned_at: number } | null {
+    const row = this.ctx.storage.sql.exec(
+      "SELECT participant_id, assigned_at FROM rotation_seat_holders WHERE seat = ?", seat,
+    ).toArray()[0];
+    return row === undefined ? null :
+      { participant_id: String(row.participant_id), assigned_at: Number(row.assigned_at) };
+  }
+
+  private hcxAccess(): HcxRoomAccess {
+    const occupants: HcxRoomAccess["occupants"] = [null, null, null, null];
+    for (let seat = 0; seat < 4; seat++) {
+      const holder = this.hcxHolderRow(seat);
+      if (holder !== null) {
+        occupants[seat] = {
+          participant_id: holder.participant_id,
+          seat: seat as HcxSeat,
+          // The holder row's assignment time is the occupancy epoch: a new
+          // holder (or the same person reseated) gets a different epoch, so
+          // a stale binding can never follow the seat.
+          occupant_epoch: `h${holder.assigned_at}`,
+          kind: this.metaGet(`participant_kind:${holder.participant_id}`) === "human" ? "human" : "muse",
+        };
+      } else {
+        // Open seats are covered by bootstrap fill-in play: a Muse occupant.
+        occupants[seat] = {
+          participant_id: `bootstrap:${seat}`,
+          seat: seat as HcxSeat,
+          occupant_epoch: "bootstrap",
+          kind: "muse",
+        };
+      }
+    }
+    return {
+      room_id: this.roomId ?? "",
+      match_id: this.game !== null ? this.rankingMatchKey(this.game) : "no-match",
+      allow_human_players: this.hcxHumanTable(),
+      occupants,
+    };
+  }
+
+  private hcxLegalCache: { key: string; actions: HcxLegalAction[] } | null = null;
+
+  /** Legal actions for a seat from the server's own currentDecisions, plus
+   *  the riichi:true discard variants it does not enumerate (clone-probed
+   *  against the real engine) and the daiminkan tile the pending discard
+   *  supplies. Probing never touches the live game. */
+  private hcxLegalActions(game: Game, seat: number): HcxLegalAction[] {
+    const cacheKey = `${game.decision_id}:${game.revision}:${seat}`;
+    if (this.hcxLegalCache !== null && this.hcxLegalCache.key === cacheKey) {
+      return this.hcxLegalCache.actions;
+    }
+    const decision = currentDecisions(game).find(d => d.seat === seat && d.decision_id === game.decision_id);
+    const out: HcxLegalAction[] = [];
+    if (decision !== undefined) {
+      const seen = new Set<string>();
+      const offer = (a: HcxLegalAction) => {
+        const key = JSON.stringify([a.action, a.tile ?? null, a.riichi === true, a.consume ?? null]);
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push(a);
+      };
+      for (const a of decision.actions) {
+        const base: HcxLegalAction = { action: a.type, seat: seat as HcxSeat };
+        if (a.tile !== undefined) base.tile = a.tile;
+        else if (a.type === "daiminkan" && game.pending) base.tile = game.pending.tile;
+        if (a.consume !== undefined) base.consume = [...a.consume];
+        offer(base);
+        if (a.type === "discard" && a.tile !== undefined && !game.riichi[seat]) {
+          const probe = structuredClone(game);
+          this.injectTime();
+          const r = applyAction(probe, {
+            action: "discard", seat, tile: a.tile, riichi: true,
+            decision_id: game.decision_id as string, expected_revision: game.revision,
+          });
+          if ("ok" in r) offer({ action: "discard", seat: seat as HcxSeat, tile: a.tile, riichi: true });
+        }
+      }
+    }
+    this.hcxLegalCache = { key: cacheKey, actions: out };
+    return out;
+  }
+
+  private hcxRecordPaipu(event: HcxEvent): void {
+    // Full provenance lives in hcx_events (ExecutionStore) and the ops log.
+    // Bound/unbound markers also enter the conventional paipu stream as a
+    // state line under their own kind, so the owner can find them in the
+    // usual export; applied moves are already in the stream as actions.
+    this.opsLog("human_chip", event);
+    if ((event.type === "human_chip_bound" || event.type === "human_chip_unbound") &&
+        this.game !== null && this.game.phase !== "finished") {
+      this.appendEvent(this.game, event.type);
+    }
+  }
+
+  private hcx(): { store: ExecutionStore; bindings: BindingService; driver: HumanChipDriver } | null {
+    if (!this.hcxHumanTable() || this.vaultNs === null) return null;
+    if (this.hcxStore !== null && this.hcxBindings !== null && this.hcxDriver !== null) {
+      return { store: this.hcxStore, bindings: this.hcxBindings, driver: this.hcxDriver };
+    }
+    const store = new ExecutionStore(this.ctx.storage as unknown as StoragePort);
+    const host = createMuseExecutionHost<Game>({
+      access: () => this.hcxAccess(),
+      game: () => this.game as Game,
+      legalActions: (g, seat) => this.hcxLegalActions(g, seat),
+      doraIndicators: (g) => doraIndicators(g),
+      applyOnClone: (g, action, fence) => {
+        this.injectTime();
+        const body: ActionBody = {
+          action: action.action, seat: action.seat,
+          decision_id: fence.decision_id, expected_revision: fence.expected_revision,
+          ...(action.tile !== undefined ? { tile: action.tile } : {}),
+          ...(action.consume !== undefined ? { consume: [...action.consume] } : {}),
+          ...(action.riichi === true ? { riichi: true } : {}),
+        };
+        const r = applyAction(g, body);
+        return "ok" in r ? { ok: true as const } : { error: String((r as { error?: unknown }).error ?? "rejected") };
+      },
+      persistGameAndPaipu: (g, event) => {
+        this.commitGameTx(g, {
+          logKind: "human_chip_action",
+          logPayload: {
+            seat: event.seat,
+            workshop_id: event.provenance?.workshop_id ?? null,
+            version: event.provenance?.version ?? null,
+            sha256: event.provenance?.sha256 ?? null,
+            decision_id: event.decision_id ?? null,
+          },
+        });
+      },
+      recordPaipu: (event) => this.hcxRecordPaipu(event),
+      publishGame: (g) => { this.game = g; this.savedRevision = g.revision; },
+      canDrive: (seat) => {
+        const g = this.game;
+        if (g === null || typeof g.decision_id !== "string") return false;
+        if (this.metaGet(`proxy_active:${seat}`) === "1") return false; // a declared prompt proxy has the seat
+        return this.currentLease(g.decision_id, seat) === null; // never steal a claim
+      },
+    });
+    const bindings = new BindingService(store, host, vaultLoader(this.vaultNs), () => this.engineNow());
+    const driver = new HumanChipDriver(store, host, () => this.engineNow());
+    this.hcxStore = store;
+    this.hcxBindings = bindings;
+    this.hcxDriver = driver;
+    return { store, bindings, driver };
+  }
+
+  private hcxClearSeat(seat: number): void {
+    if (!this.hcxHumanTable()) return;
+    const h = this.hcx();
+    if (h !== null) h.bindings.clearSeat(seat as HcxSeat);
+  }
+
+  /** Engine-time wakeup when a bound human seat can be driven right now. */
+  private hcxChipWakeup(): number | null {
+    const h = this.hcx();
+    if (h === null) return null;
+    try {
+      return h.driver.nextSeat() !== null ? this.engineNow() + 1 : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async hcxDriveBounded(): Promise<void> {
+    const h = this.hcx();
+    if (h === null) return;
+    for (let i = 0; i < 16; i++) {
+      let seat: HcxSeat | null = null;
+      try { seat = h.driver.nextSeat(); } catch { return; }
+      if (seat === null) return;
+      await h.driver.driveOne(seat);
+    }
+  }
+
+  private async handleHumanChip(request: Request, who: Principal): Promise<Response> {
+    const h = this.hcx();
+    if (h === null) return json({ error: "human chip execution is not available in this room" }, 404);
+    let principal: HcxPrincipal | null = null;
+    if (who.role === "player" && who.seat !== null) {
+      const holder = this.hcxHolderRow(who.seat);
+      principal = {
+        participant_id: who.participant_id,
+        seat: who.seat as HcxSeat,
+        occupant_epoch: holder !== null && holder.participant_id === who.participant_id
+          ? `h${holder.assigned_at}` : "not-holder",
+        kind: this.metaGet(`participant_kind:${who.participant_id}`) === "human" ? "human" : "muse",
+      };
+    }
+    const response = await handleBindingRequest(request, {
+      bindings: h.bindings,
+      authenticateParticipant: () => principal,
+      publicOrigin: "https://muse-jansou.muse-jansou.workers.dev",
+    });
+    if (request.method !== "GET") await this.syncIfNeeded(true);
+    return response;
+  }
+
   // ---- Clock / Alarm ----
 
   private engineNow(): number {
@@ -1446,7 +1694,16 @@ export class RoomDO extends DurableObject {
     await this.ctx.blockConcurrencyWhile(async () => {
       let alarmOperation: "get" | "set" | "delete" = "get";
       try {
-        const deadline = this.nextEngineDeadline();
+        // The chip wakeup only ever ADDS an earlier alarm; it never deletes
+        // or postpones the original clock deadline.
+        const engineDeadline = this.nextEngineDeadline();
+        const chipDue = this.hcxChipWakeup();
+        let deadline = engineDeadline;
+        let chipEarliest = false;
+        if (chipDue !== null && (deadline === null || chipDue < deadline)) {
+          deadline = chipDue;
+          chipEarliest = true;
+        }
         const existing = await this.ctx.storage.getAlarm();
         this.lastAlarmCheckAt = Date.now();
         if (deadline === null) {
@@ -1459,6 +1716,19 @@ export class RoomDO extends DurableObject {
         }
         const desired = deadline - this.timeOffsetMs;
         if (desired <= Date.now()) {
+          if (chipEarliest) {
+            // A bound human seat is drivable now: fire almost immediately.
+            // The driver's per-decision attempt claim guarantees this cannot
+            // spin — after one attempt the wakeup disappears.
+            const soon = Date.now() + 200;
+            if (existing !== soon) {
+              alarmOperation = "set";
+              await this.ctx.storage.setAlarm(soon);
+              this.alarmSetCount += 1;
+            }
+            this.alarmSyncFailed = false;
+            return;
+          }
           // settleNow() has already been attempted. Re-arming this due deadline
           // would loop forever if the engine cannot make progress.
           if (existing !== null) {
@@ -1543,6 +1813,11 @@ export class RoomDO extends DurableObject {
       this.game = next;
       this.savedRevision = next.revision;
     }
+    await this.syncAlarmSafely();
+    // Human chip execution runs AFTER the original clock settlement above:
+    // expired decisions belong to the clock first. A failed chip attempt is
+    // recorded by the driver and never retried within this alarm.
+    await this.hcxDriveBounded();
     await this.syncAlarmSafely();
   }
 
@@ -2202,6 +2477,7 @@ export class RoomDO extends DurableObject {
       this.ctx.storage.sql.exec(
         "DELETE FROM rotation_seat_holders WHERE seat = ? AND token_hash = ?", seat, who.token_hash,
       );
+      this.hcxClearSeat(seat);
       this.metaSet(`proxy_active:${seat}`, "0");
       this.metaSet(`proxy_count:${seat}`, "0");
       this.opsLog("player_left", { participant_id: who.participant_id, seat });
@@ -2408,6 +2684,7 @@ export class RoomDO extends DurableObject {
     this.ctx.storage.sql.exec("UPDATE credentials SET enabled = 0 WHERE token_hash = ?", holder.token_hash);
     this.ctx.storage.sql.exec("DELETE FROM leases WHERE seat = ?", seat);
     this.ctx.storage.sql.exec("DELETE FROM rotation_seat_holders WHERE seat = ?", seat);
+    this.hcxClearSeat(seat);
     this.metaSet(`timeout_streak:${seat}`, "0");
     this.metaSet(`proxy_active:${seat}`, "0");
     this.metaSet(`proxy_count:${seat}`, "0");
@@ -2603,6 +2880,11 @@ export class RoomDO extends DurableObject {
     result.occupancy = this.occupancySummary();
     result.ranking = this.rankingSummary();
     result.recent_results = this.recentMatchResults();
+    if (g.ruleset.allow_human_players === true) {
+      // Provenance only (workshop / version / hash) — never keys or programs.
+      const h = this.hcx();
+      result.human_chip_drivers = h !== null ? h.bindings.view() : [];
+    }
     return result;
   }
 
@@ -2946,6 +3228,14 @@ export class RoomDO extends DurableObject {
       return json({ error: "invalid icon" }, 400);
     }
     if (!validateAvatarUrl(parsed.avatar_url)) return json({ error: "invalid avatar_url" }, 400);
+    if (parsed.human !== undefined && typeof parsed.human !== "boolean") {
+      return json({ error: "invalid human flag" }, 400);
+    }
+    if (parsed.human === true && this.game?.ruleset.allow_human_players !== true) {
+      // Human-held seats are opt-in per table (ruleset.allow_human_players).
+      // Muse joins never set human:true and are unaffected.
+      return json({ error: "human seats are not open in this room" }, 403);
+    }
     const requestedSeat = parsed.support_seat === undefined || parsed.support_seat === null ? null : parsed.support_seat;
     if (requestedSeat !== null && !isSeat(requestedSeat)) return json({ error: "invalid support_seat" }, 400);
     const codeHash = await sha256Hex(parsed.invite_code);
@@ -2982,6 +3272,10 @@ export class RoomDO extends DurableObject {
         "INSERT INTO credentials (token_hash, participant_id, role, seat, display_name, icon, avatar_url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         hash, pid, role, seat, String(parsed.display_name).trim(), parsed.icon ?? null, parsed.avatar_url ?? null, now,
       );
+      // The human flag is a join-time gate elsewhere; persist the holder kind
+      // so the execution connection can later prove this seat is human-held.
+      // Absence of the marker means a Muse (or bootstrap) participant.
+      if (parsed.human === true) this.metaSet(`participant_kind:${pid}`, "human");
       // Existing /join stays valid. An open seat is assigned immediately;
       // a second same-seat invite may register, but is not the current holder.
       if (role === "player" && isSeat(seat)) {
@@ -3217,6 +3511,10 @@ export class RoomDO extends DurableObject {
       if (this.roomId === null && conveyedId && /^[a-zA-Z0-9_-]{1,128}$/.test(conveyedId)) {
         this.metaSet("room_id", conveyedId);
         this.roomId = conveyedId;
+      }
+      if (path === "/human-chip" &&
+          (request.method === "GET" || request.method === "POST" || request.method === "DELETE")) {
+        return await this.handleHumanChip(request, principal);
       }
       if (path === "/leave" && request.method === "POST") return await this.handleLeave(principal);
       if (path === "/vacate" && request.method === "POST") return await this.handleVacate(request, principal);

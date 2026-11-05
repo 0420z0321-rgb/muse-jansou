@@ -9,6 +9,9 @@
 // (Authorization: Bearer); the server then returns that spectator's scoped
 // view, in which only their support seat's hand is visible. The page simply
 // renders whatever hands the state carries.
+import { WATCH_SECRET_SCRIPT } from "./watch_secret_browser.ts";
+import { COVER_RETURN_LINK, COVER_RETURN_STYLE } from "./cover_navigation.ts";
+
 export const WATCH_HTML = `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -35,7 +38,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
   #gate select { font-size:14px; padding:8px; width:76%; border-radius:6px; border:none; margin-bottom:8px; }
   #gate .note { font-size:12px; opacity:.85; }
   .htiles.open .tile { outline:1px solid #c9a227; }
-  .tile.aka { background:#fbe9e7; box-shadow:inset 0 0 0 2px #c0392b; }
+  .tile.aka { background:linear-gradient(180deg,#fff5f2 0%,#fdeae4 55%,#f6d9d2 100%); box-shadow:inset 0 0 0 2px #c0392b, inset 0 -3px 0 rgba(163,80,60,.45), 0 3px 0 #5d7a58, 0 5px 6px rgba(0,0,0,.45); }
   .seatnote { font-size:11px; color:#e8b13c; }
   #gate button { font-size:16px; padding:8px 14px; border-radius:6px; border:none; background:#e8b13c; color:#222; cursor:pointer; }
   #gate .err { color:#ff9a9a; min-height:20px; font-size:13px; }
@@ -108,7 +111,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
   .handstrip.v .tile { margin:-4px 0; }
   .handstrip .melds { margin:0 0 0 10px; }
   .handstrip.v .melds { margin:10px 0 0; }
-  .tile.back { background:linear-gradient(180deg,#35709e,#2456a6); }
+  .tile.back { background:linear-gradient(180deg,#3d7ca8,#2456a6 60%,#1d468a); box-shadow:inset 0 0 0 1px rgba(255,255,255,.35), inset 0 -3px 0 rgba(10,30,70,.5), 0 3px 0 #4c6b4a, 0 5px 6px rgba(0,0,0,.45); }
   .handstrip .score { color:#ffd968; }
   .riichi { background:#c0392b; color:#fff; border-radius:4px; padding:0 6px; font-size:12px; margin-left:6px; }
   .backs { font-size:12px; letter-spacing:1px; min-height:16px; }
@@ -125,14 +128,14 @@ export const WATCH_HTML = `<!DOCTYPE html>
   .pondbox .tile { transform:rotate(var(--rot)); }
   .pondbox .tile.ri { transform:rotate(calc(var(--rot) + 90deg)); }
   .pondbox.turn { border-color:#e8b13c; }
-  .tile { display:inline-block; background:linear-gradient(180deg,#fffdf4,#f1ead3); border-radius:3.5px; box-shadow:0 2px 0 #b3a888, 0 3px 4px rgba(0,0,0,.35); padding:0; line-height:0; vertical-align:middle; }
+  .tile { display:inline-block; background:linear-gradient(180deg,#fffef9 0%,#fdf8e7 55%,#f2ead0 100%); border-radius:4px; box-shadow:inset 0 0 0 1px rgba(90,80,40,.28), inset 0 2px 1px rgba(255,255,255,.9), inset 0 -3px 0 rgba(163,148,98,.6), 0 3px 0 #5d7a58, 0 5px 6px rgba(0,0,0,.45); padding:0; line-height:0; vertical-align:middle; }
   .tile svg { display:block; width:100%; height:100%; }
-  .pondbox .tile { width:21px; height:28px; }
-  .handstrip .tile { width:26px; height:35px; }
+  .pondbox .tile { width:23px; height:31px; }
+  .handstrip .tile { width:29px; height:39px; }
   .handstrip .tile.drawn { margin-left:10px; }
   .handstrip.v .tile.drawn { margin-left:0; margin-top:10px; }
   #meta .tile { width:19px; height:26px; }
-  .melds .tile { width:22px; height:30px; }
+  .melds .tile { width:24px; height:32px; }
   .meldgroup { margin-right:6px; white-space:nowrap; }
   .tile.txt { color:#222; font-size:12px; line-height:1.4; padding:1px 4px; min-width:16px; text-align:center; }
   .tile.dim { filter:grayscale(.7); opacity:.5; }
@@ -164,9 +167,11 @@ export const WATCH_HTML = `<!DOCTYPE html>
   #csText { flex:1; padding:8px; border-radius:6px; border:none; font-size:14px; }
   #csSend { padding:8px 14px; border-radius:6px; border:none; background:#e8b13c; color:#222; cursor:pointer; font-weight:bold; }
   #csMsg { font-size:12px; color:#ffd968; min-height:15px; margin-top:4px; }
+${COVER_RETURN_STYLE}
 </style>
 </head>
 <body>
+${COVER_RETURN_LINK}
 <div id="gate">
   <h1>🀄 Muse雀荘 観戦</h1>
   <select id="mode">
@@ -240,6 +245,7 @@ export const WATCH_HTML = `<!DOCTYPE html>
     <div class="mb-foot">両卓まとめて見る → <a href="/members">選手名鑑ページ</a></div>
   </div>
 </div>
+${WATCH_SECRET_SCRIPT}
 <script>
 var roomId = location.pathname.split("/")[2];
 var NAMES = ["1m","2m","3m","4m","5m","6m","7m","8m","9m","1p","2p","3p","4p","5p","6p","7p","8p","9p","1s","2s","3s","4s","5s","6s","7s","8s","9s","東","南","西","北","白","發","中"];
@@ -257,7 +263,7 @@ function tname(t) {
 var KANJI_NUM = ["一","二","三","四","五","六","七","八","九"];
 var HONOR_CH = ["東","南","西","北","白","發","中"];
 var CB = "#2456a6", CG = "#1e8a4c", CR = "#c62f3b", IVORY = "#f7f2e2";
-function circ(x, y, r, fill) { return '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + fill + '"/>'; }
+function circ(x, y, r, fill) { return '<circle cx="' + x + '" cy="' + y + '" r="' + r + '" fill="' + fill + '" stroke="rgba(0,0,0,.22)" stroke-width="0.6"/>'; }
 function pinzuFace(n) {
   if (n === 1) {
     return circ(15, 20, 10.5, CG) + circ(15, 20, 8, IVORY) +
@@ -276,13 +282,15 @@ function pinzuFace(n) {
   };
   var r = n <= 3 ? 5 : n <= 5 ? 4.8 : n === 9 ? 4 : 3.6;
   return (P[n] || []).map(function(p) {
-    return circ(p[0], p[1], r, p[2]) + circ(p[0], p[1], r * 0.42, IVORY);
+    return circ(p[0], p[1], r, p[2]) + circ(p[0], p[1], r * 0.58, IVORY) +
+      circ(p[0], p[1], r * 0.34, p[2]) + circ(p[0], p[1], r * 0.13, IVORY);
   }).join("");
 }
 function stick(x, y, color, rot) {
   return '<g transform="translate(' + x + ' ' + y + ')' + (rot ? ' rotate(' + rot + ')' : '') + '">' +
-    '<rect x="-2.6" y="-5.5" width="5.2" height="11" rx="2.4" fill="' + color + '"/>' +
-    '<rect x="-2.6" y="-0.7" width="5.2" height="1.4" fill="' + IVORY + '" opacity="0.85"/></g>';
+    '<rect x="-2.6" y="-5.5" width="5.2" height="11" rx="2.4" fill="' + color + '" stroke="rgba(0,0,0,.22)" stroke-width="0.5"/>' +
+    '<rect x="-2.6" y="-2.9" width="5.2" height="1.3" fill="' + IVORY + '" opacity="0.85"/>' +
+    '<rect x="-2.6" y="1.8" width="5.2" height="1.3" fill="' + IVORY + '" opacity="0.85"/></g>';
 }
 function souzuFace(n) {
   var G = CG, B = CB, R = CR;
@@ -553,11 +561,9 @@ function render(st) {
   fitBoard();
 }
 function load() {
-  var mode = sessionStorage.getItem("watchMode") || "pw";
-  var secret = sessionStorage.getItem("watchSecret") || "";
-  var headers = mode === "token"
-    ? { "Authorization": "Bearer " + secret }
-    : { "X-Watch-Password": secret };
+  var mode = window.MuseWatchSecret.getMode();
+  var secret = window.MuseWatchSecret.getCredential(mode);
+  var headers = window.MuseWatchSecret.getHeaders(mode);
   fetch("/rooms/" + roomId + "/state", { headers: headers })
     .then(function(res) {
       if (res.status === 401) {
@@ -600,20 +606,49 @@ document.getElementById("mode").addEventListener("change", function() {
   document.getElementById("prompt").textContent =
     this.value === "token" ? "観戦トークンを入れてください" : "合言葉を入れてください";
 });
-document.getElementById("go").addEventListener("click", function() {
-  sessionStorage.setItem("watchMode", document.getElementById("mode").value);
-  sessionStorage.setItem("watchSecret", document.getElementById("pw").value.trim());
-  load();
+document.getElementById("go").addEventListener("click", async function() {
+  var button = this;
+  var selected = document.getElementById("mode").value === "token" ? "token" : "pw";
+  var field = document.getElementById("pw");
+  var message = document.getElementById("err");
+  var value = field.value.trim();
+  if (!value || button.disabled) return;
+  button.disabled = true;
+  try {
+    if (selected === "pw") {
+      var result = await window.MuseWatchSecret.verifyPassword(value, [roomId]);
+      if (field.value.trim() !== value || document.getElementById("mode").value !== selected) {
+        message.textContent = "入力が変わったため、もう一度確認してください。";
+        return;
+      }
+      if (result.status !== "accepted") {
+        message.textContent = result.status === "rejected"
+          ? "合言葉が受理されませんでした。" : "現在、確認先へ接続できません。";
+        return;
+      }
+      if (!window.MuseWatchSecret.savePassword(value).ok ||
+          !window.MuseWatchSecret.setMode("pw")) {
+        message.textContent = "ブラウザの保存・モード切替ができませんでした。";
+        return;
+      }
+    } else {
+      if (!window.MuseWatchSecret.saveToken(value).ok) {
+        message.textContent = "このタブへ観戦トークンを保存できませんでした。";
+        return;
+      }
+    }
+    field.value = "";
+    load();
+  } finally {
+    button.disabled = false;
+  }
 });
 document.getElementById("pw").addEventListener("keydown", function(e) {
   if (e.key === "Enter") document.getElementById("go").click();
 });
 document.getElementById("refresh").addEventListener("click", load);
-if (sessionStorage.getItem("watchPw") && !sessionStorage.getItem("watchSecret")) {
-  sessionStorage.setItem("watchMode", "pw");
-  sessionStorage.setItem("watchSecret", sessionStorage.getItem("watchPw"));
-}
-if (sessionStorage.getItem("watchSecret")) load();
+window.MuseWatchSecret.readPassword(); // 必要なら旧資格を安全に移行
+if (window.MuseWatchSecret.getCredential()) load();
 setInterval(function() {
   if (document.getElementById("table").style.display === "block") load();
 }, 5000);
@@ -681,8 +716,8 @@ setInterval(function() {
 }, 18000);
 function dmPollToken() {
   if (dmTokDead) return;
-  if ((sessionStorage.getItem("watchMode") || "pw") !== "token") return;
-  var secret = sessionStorage.getItem("watchSecret") || "";
+  if (window.MuseWatchSecret.getMode() !== "token") return;
+  var secret = window.MuseWatchSecret.getToken();
   if (!secret) return;
   fetch("/rooms/" + roomId + "/cheers?after=" + dmTokCursor, { headers: { "Authorization": "Bearer " + secret } })
     .then(function(res) { if (!res.ok) { dmTokDead = true; return null; } return res.json(); })
@@ -727,7 +762,7 @@ function viewPivot(st) {
   return (st && typeof st.dealer === "number") ? st.dealer : 0;
 }
 function cheerHeaders() {
-  var h = { "X-Watch-Password": sessionStorage.getItem("watchSecret") || "",
+  var h = { "X-Watch-Password": window.MuseWatchSecret.getPassword(),
             "X-Watch-Client": watchClientId() };
   var sup = guestSupport();
   if (sup !== null) h["X-Watch-Support"] = String(sup);
@@ -803,7 +838,7 @@ function cheerTabSync() {
 }
 function afterRender(st) {
   window.__lastState = st;
-  var mode = sessionStorage.getItem("watchMode") || "pw";
+  var mode = window.MuseWatchSecret.getMode();
   var panel = document.getElementById("cheerPanel");
   if (mode !== "pw") { panel.style.display = "none"; cheerTabWanted = false; cheerTabSync(); return; }
   panel.style.display = "block";
@@ -1405,7 +1440,7 @@ function fxOnEvent(ev) {
 }
 function maybeInitWatchFX() {
   if (fxInited || !window.JansouSE) return;
-  var secret = sessionStorage.getItem("watchSecret") || "";
+  var secret = window.MuseWatchSecret.getCredential();
   if (!secret) return;
   fxInited = true;
   try {
@@ -1413,9 +1448,7 @@ function maybeInitWatchFX() {
       roomId: roomId,
       button: document.getElementById("seButton"),
       getAuthHeaders: function() {
-        var m = sessionStorage.getItem("watchMode") || "pw";
-        var s = sessionStorage.getItem("watchSecret") || "";
-        return m === "token" ? { "Authorization": "Bearer " + s } : { "X-Watch-Password": s };
+        return window.MuseWatchSecret.getHeaders();
       }
     });
     window.JansouEvents.subscribe(fxOnEvent);
@@ -1428,9 +1461,7 @@ function maybeInitWatchFX() {
 // Participant-supplied fields are rendered with textContent only.
 var membersOpen = false;
 function membersHeaders() {
-  var mode = sessionStorage.getItem("watchMode") || "pw";
-  var secret = sessionStorage.getItem("watchSecret") || "";
-  return mode === "token" ? { "Authorization": "Bearer " + secret } : { "X-Watch-Password": secret };
+  return window.MuseWatchSecret.getHeaders();
 }
 function mbAvatar(m) {
   var av = document.createElement("div");

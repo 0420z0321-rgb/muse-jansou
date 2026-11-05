@@ -1,6 +1,10 @@
 // 両卓の入口ページ。各卓の状態（席・待ち・進行）を合言葉で読み、
-// 観戦ページへのリンクと合わせて表示する。パスワードは watch ページと
-// 同じ sessionStorage キーに保存するので、そのまま観戦へ入れる。
+// 観戦ページへのリンクと合わせて表示する。合言葉は watch ページと
+// 共通の MuseWatchSecret ヘルパー経由で読み書きする（localStorage 永続化＋
+// sessionStorage からの移行はヘルパーが担う）ので、そのまま観戦へ入れる。
+import { WATCH_SECRET_SCRIPT } from "./watch_secret_browser.ts";
+import { COVER_RETURN_LINK, COVER_RETURN_STYLE } from "./cover_navigation.ts";
+
 export const TABLES_HTML = `<!doctype html>
 <html lang="ja">
 <head>
@@ -23,10 +27,13 @@ export const TABLES_HTML = `<!doctype html>
   .seat.open { opacity:.55; border-style:dashed; }
   .watch { display:inline-block; background:#ffd968; color:#402d00; font-weight:bold; text-decoration:none; padding:9px 20px; border-radius:999px; font-size:16px; }
   .note { font-size:12.5px; opacity:.8; line-height:1.7; margin-top:16px; }
+  .note a { color:#ffd968; }
   #err { color:#ffb3c1; text-align:center; min-height:18px; font-size:13px; }
+${COVER_RETURN_STYLE}
 </style>
 </head>
 <body>
+${COVER_RETURN_LINK}
 <div class="wrap">
   <h1>🀄 Muse雀荘</h1>
   <div class="sub">卓は2つあります。状態を見て、入りたい卓を選んでください。</div>
@@ -37,8 +44,10 @@ export const TABLES_HTML = `<!doctype html>
   <div id="cards"></div>
   <div class="note">
     参加（着席・待ち列）は Helper から行います。待ち列は卓ごとです。空いている卓ではなく、待ちたい卓で待つこともできます。待っている間ずっと張り付く必要はありません。
+    登録したみなさんの紹介は<a href="/members">選手名鑑</a>で見られます。
   </div>
 </div>
+${WATCH_SECRET_SCRIPT}
 <script>
 var ROOMS = [
   { id: "c4c3d9be-ed74-458d-8956-11bd345c477c", name: "一卓" },
@@ -50,7 +59,7 @@ function esc(x) {
   });
 }
 function load() {
-  var secret = sessionStorage.getItem("watchSecret") || "";
+  var secret = window.MuseWatchSecret.getPassword();
   var headers = { "X-Watch-Password": secret };
   var cards = document.getElementById("cards");
   var pending = ROOMS.length;
@@ -95,18 +104,49 @@ function load() {
 function boot() {
   var cards = document.getElementById("cards");
   cards.innerHTML = ROOMS.map(function(r, i) { return '<div id="card-' + i + '"></div>'; }).join("");
-  if (!sessionStorage.getItem("watchSecret")) {
+  if (!window.MuseWatchSecret.getPassword()) {
     document.getElementById("gate").style.display = "block";
   }
   load();
   setInterval(load, 15000);
 }
-document.getElementById("go").addEventListener("click", function() {
-  var v = document.getElementById("pw").value.trim();
-  if (!v) return;
-  sessionStorage.setItem("watchMode", "pw");
-  sessionStorage.setItem("watchSecret", v);
-  load();
+document.getElementById("go").addEventListener("click", async function() {
+  var button = this;
+  var field = document.getElementById("pw");
+  var message = document.getElementById("err");
+  var value = field.value.trim();
+  if (!value || button.disabled) return;
+  button.disabled = true;
+  message.textContent = "確認しています…";
+  try {
+    var result = await window.MuseWatchSecret.verifyPassword(
+      value, ROOMS.map(function(room) { return room.id; })
+    );
+    if (field.value.trim() !== value) {
+      message.textContent = "入力が変わったため、もう一度確認してください。";
+      return;
+    }
+    if (result.status !== "accepted") {
+      message.textContent = result.status === "rejected"
+        ? "合言葉が受理されませんでした。"
+        : "現在、合言葉を確認できません。保存値は変更していません。";
+      return;
+    }
+    var saved = window.MuseWatchSecret.savePassword(value);
+    if (!saved.ok) {
+      message.textContent = "合言葉は受理されましたが、ブラウザへ保存できませんでした。";
+      return;
+    }
+    if (!window.MuseWatchSecret.setMode("pw")) {
+      message.textContent = "合言葉は保存済みですが、観戦モードを切り替えられません。";
+      return;
+    }
+    field.value = "";
+    message.textContent = "";
+    load();
+  } finally {
+    button.disabled = false;
+  }
 });
 boot();
 </script>
